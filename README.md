@@ -1,7 +1,6 @@
 # TR-FRX autoprocessing
 
-A reproducible command-line pipeline for processing **time-resolved
-fixed-target raster (TR-FRX)** serial crystallography data — from raw CBF
+A reproducible command-line pipeline for processing **Time-Resolved Functional Rotation Crystallography (TR-FRX)** serial crystallography data — from raw CBF
 diffraction images all the way to **Fo–Fo difference maps** and their
 **singular-value decomposition (SVD)**.
 
