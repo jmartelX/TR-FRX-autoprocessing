@@ -214,15 +214,17 @@ mkdir /data/processed/PfuGRHPR_006/dFo && cd $_
 
 ## Citing this work
 
-If this pipeline is useful in your research, please cite it. A
-[`CITATION.cff`](CITATION.cff) is included, so GitHub shows a **"Cite this
-repository"** button on the repo page.
+If this pipeline is useful in your research, please cite the associated paper.
+A [`CITATION.cff`](CITATION.cff) is included, so GitHub also shows a **"Cite
+this repository"** button on the repo page.
 
-> 📄 **Associated paper:** *(to be added — see `CITATION.cff`)*
+> 📄 **Associated paper:**
 >
-> ```
-> Author(s). "Title." Journal, Year. DOI.
-> ```
+> Martel, J. M. J., Caramello, N., Coquille, S., Mathieu, E., Petit, L.,
+> Jacquet, P., Appolaire, A., Leonarski, F., Olieric, V., Wang, M., Madern, D.,
+> Royant, A. & Engilberge, S. (2026). *Time-resolved functional rotation
+> crystallography reveals protein dynamics and catalysis.* **bioRxiv**.
+> doi: [10.64898/2026.04.24.718481](https://doi.org/10.64898/2026.04.24.718481)
 
 ---
 

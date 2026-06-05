@@ -3,26 +3,42 @@ message: "If you use this software, please cite both the software and the associ
 title: "TR-FRX-autoprocessing"
 authors:
   - family-names: "Martel"
-    given-names: "Julien"
+    given-names: "Julien M. J."
     # orcid: "https://orcid.org/XXXX-XXXX-XXXX-XXXX"   # TODO: add your ORCID
 repository-code: "https://github.com/jmartelX/TR-FRX-autoprocessing"
 license: MIT
-# ---------------------------------------------------------------------------
-# TODO: fill in the associated paper below, then this becomes the preferred
-# citation shown by GitHub's "Cite this repository" button.
-# ---------------------------------------------------------------------------
 preferred-citation:
   type: article
-  title: "TODO — paper title"
+  title: "Time-resolved functional rotation crystallography reveals protein dynamics and catalysis"
   authors:
     - family-names: "Martel"
-      given-names: "Julien"
-    # - family-names: "..."
-    #   given-names: "..."
-  journal: "TODO — journal name"
-  year: 2026          # TODO
-  # volume: "TODO"
-  # issue: "TODO"
-  # start: 0          # first page
-  # end: 0            # last page
-  # doi: "10.XXXX/XXXXX"   # TODO
+      given-names: "J. M. J."
+    - family-names: "Caramello"
+      given-names: "N."
+    - family-names: "Coquille"
+      given-names: "S."
+    - family-names: "Mathieu"
+      given-names: "E."
+    - family-names: "Petit"
+      given-names: "L."
+    - family-names: "Jacquet"
+      given-names: "P."
+    - family-names: "Appolaire"
+      given-names: "A."
+    - family-names: "Leonarski"
+      given-names: "F."
+    - family-names: "Olieric"
+      given-names: "V."
+    - family-names: "Wang"
+      given-names: "M."
+    - family-names: "Madern"
+      given-names: "D."
+    - family-names: "Royant"
+      given-names: "A."
+    - family-names: "Engilberge"
+      given-names: "S."
+  journal: "bioRxiv"
+  year: 2026
+  month: 4
+  doi: "10.64898/2026.04.24.718481"
+  notes: "Preprint"
