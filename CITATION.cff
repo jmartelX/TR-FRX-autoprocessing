@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the associated paper."
+title: "TR-FRX-autoprocessing"
+authors:
+  - family-names: "Martel"
+    given-names: "Julien"
+    # orcid: "https://orcid.org/XXXX-XXXX-XXXX-XXXX"   # TODO: add your ORCID
+repository-code: "https://github.com/jmartelX/TR-FRX-autoprocessing"
+license: MIT
+# ---------------------------------------------------------------------------
+# TODO: fill in the associated paper below, then this becomes the preferred
+# citation shown by GitHub's "Cite this repository" button.
+# ---------------------------------------------------------------------------
+preferred-citation:
+  type: article
+  title: "TODO — paper title"
+  authors:
+    - family-names: "Martel"
+      given-names: "Julien"
+    # - family-names: "..."
+    #   given-names: "..."
+  journal: "TODO — journal name"
+  year: 2026          # TODO
+  # volume: "TODO"
+  # issue: "TODO"
+  # start: 0          # first page
+  # end: 0            # last page
+  # doi: "10.XXXX/XXXXX"   # TODO

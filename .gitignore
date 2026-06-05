@@ -1,0 +1,29 @@
+# macOS / editor cruft
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Crystallography data / outputs (this repo ships code, not data)
+*.mtz
+*.cbf
+*.h5
+*.map
+*.ccp4
+*.pdb
+*.csv
+*.log
+*.eff
