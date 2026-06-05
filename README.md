@@ -13,7 +13,7 @@ dispensing nanoliter-scale droplets of ligand or substrate onto a crystal
 mounted on a conventional holder, and diffraction is recorded continuously
 during crystal rotation. The continuous data collection is then **split into a
 series of complete subdatasets, each corresponding to one time point**, spanning
-timescales from ~137 ms to minutes. (Temporal resolution = the time needed to
+timescales from ms to minutes. (Temporal resolution = the time needed to
 collect one complete subdataset, so higher-symmetry space groups allow faster
 time points.)
 
