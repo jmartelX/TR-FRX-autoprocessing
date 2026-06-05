@@ -1,14 +1,35 @@
 # TR-FRX autoprocessing
 
-A reproducible command-line pipeline for processing **time-resolved
-fixed-target raster (TR-FRX)** serial crystallography data — from raw CBF
-diffraction images all the way to **Fo–Fo difference maps** and their
-**singular-value decomposition (SVD)**.
+A reproducible command-line pipeline for processing **Time-Resolved Functional
+Rotation Crystallography (TR-FRX)** data — from raw CBF diffraction images all
+the way to **Fo–Fo difference maps** and their **singular-value decomposition
+(SVD)**.
 
-The pipeline wraps and orchestrates well-established crystallography software
-(autoPROC, CCP4, PHENIX) with a small set of Python/shell tools so that an
-entire multi-chunk, time-resolved dataset can be processed with a handful of
-commands.
+TR-FRX captures real-time structural snapshots of ligand binding and enzymatic
+catalysis in **single protein crystals at room temperature**, using standard
+rotation-based X-ray data collection on conventional beamline infrastructure —
+no specialized sample-delivery hardware required. A reaction is triggered by
+dispensing nanoliter-scale droplets of ligand or substrate onto a crystal
+mounted on a conventional holder, and diffraction is recorded continuously
+during crystal rotation. The continuous data collection is then **split into a
+series of complete subdatasets, each corresponding to one time point**, spanning
+timescales from ~137 ms to minutes. (Temporal resolution = the time needed to
+collect one complete subdataset, so higher-symmetry space groups allow faster
+time points.)
+
+This repository covers the **downstream data-processing** half of TR-FRX: it
+turns that series of per-time-point subdatasets into **Fo–Fo / isomorphous
+difference maps** — Fo(t) – Fo(reference) — and the **SVD components** that
+summarise the structural changes across the time series. It wraps and
+orchestrates well-established crystallography software (autoPROC, CCP4, PHENIX)
+with a small set of Python/shell tools so an entire time-resolved dataset can be
+processed with a handful of commands.
+
+> Throughout this documentation, **"chunk" = "subdataset" = one time point** —
+> a complete sub-dataset extracted from the continuous rotation collection.
+
+See the associated paper for the method itself ([Citing this
+work](#citing-this-work)).
 
 ---
 
