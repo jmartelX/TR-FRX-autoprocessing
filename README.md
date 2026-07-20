@@ -1,9 +1,9 @@
 # TR-FRX autoprocessing
 
 A reproducible command-line pipeline for processing **Time-Resolved Functional
-Rotation Crystallography (TR-FRX)** data — from raw CBF diffraction images all
-the way to **Fo–Fo difference maps** and their **singular-value decomposition
-(SVD)**.
+Rotation Crystallography (TR-FRX)** data — from raw diffraction images all the
+way to **Fo–Fo difference maps**, their **singular-value decomposition (SVD)**
+and an automated **peak analysis**, in a single command.
 
 TR-FRX captures real-time structural snapshots of ligand binding and enzymatic
 catalysis in **single protein crystals at room temperature**, using standard
@@ -19,11 +19,12 @@ time points.)
 
 This repository covers the **downstream data-processing** half of TR-FRX: it
 turns that series of per-time-point subdatasets into **Fo–Fo / isomorphous
-difference maps** — Fo(t) – Fo(reference) — and the **SVD components** that
-summarise the structural changes across the time series. It wraps and
-orchestrates well-established crystallography software (autoPROC, CCP4, PHENIX)
-with a small set of Python/shell tools so an entire time-resolved dataset can be
-processed with a handful of commands.
+difference maps** — Fo(t) – Fo(reference) — the **SVD components** that summarise
+the structural changes across the time series, and a per-timepoint **peak
+analysis** with a self-contained HTML report. It wraps and orchestrates
+well-established crystallography software (autoPROC, CCP4, PHENIX, PyMOL) with a
+small set of Python/shell tools so an entire time-resolved dataset can be
+processed with **two commands**.
 
 > Throughout this documentation, **"chunk" = "subdataset" = one time point** —
 > a complete sub-dataset extracted from the continuous rotation collection.
@@ -35,14 +36,12 @@ work](#citing-this-work)).
 
 ## Pipeline at a glance
 
+Two scripts take you from raw images to difference maps, SVD and peaks:
+
 | Step | Script | What it does |
 |:---:|---|---|
-| 0 | `scripts/TR-FRX_autoPROC_cbf.sh` | Submits **chunked autoPROC jobs** to SLURM → produces `autoPROC_*` folders |
-| 0b | `scripts/fix_cbf_headers.py` | *(optional)* Repairs broken/missing CBF headers before processing |
-| 1 | `scripts/copy_files.py` | Collects the useful files from each `autoPROC_*` folder into a clean tree |
-| 2 | `scripts/fetch_clean_mtz.py` | Finds and **cleans** the MTZs (keeps only `H K L F SIGF FreeR_flag` via CCP4 `cad`) |
-| 3 | `scripts/diffmaps.py` | Computes **Fo–Fo difference maps** for every dataset against a reference (PHENIX) |
-| 4 | `scripts/SVD_all_in_one.py` | Runs **SVD** on the difference-map series to extract time-resolved components |
+| 0 | `scripts/TR-FRX_autoPROC.sh` | Submits **chunked autoPROC jobs** to SLURM (auto-detects **CBF** or **HDF5**) → `autoPROC_*` chunk folders + consolidated reports |
+| 1+ | `scripts/trfrx_full_pipeline.py` | **One command**: copy chunks → clean MTZs → `dimple` the reference → **Fo–Fo difference maps** → **SVD** → **peak analysis** → **HTML report** |
 
 Each script is self-documenting — run it with `-h`/`--help`, or read the
 docstring at the top of the file.
@@ -51,34 +50,26 @@ docstring at the top of the file.
 
 ## Requirements
 
-**External software** (must be available on your `PATH` / loaded as modules):
+**External software** (on your `PATH` / loaded as modules):
 
 | Tool | Used by | Provides |
 |---|---|---|
 | [autoPROC](https://www.globalphasing.com/autoproc/) | step 0 | `process` |
-| SLURM | step 0 | `sbatch` (cluster job submission) |
-| [CCP4](https://www.ccp4.ac.uk/) | step 2 | `cad`, `mtzdmp` |
-| [PHENIX](https://phenix-online.org/) | steps 3–4 | `phenix.fobs_minus_fobs_map`, `phenix.python` |
-
-On an HPC system these are typically loaded with environment modules, e.g.:
-
-```bash
-module load autoPROC ccp4 phenix
-```
+| SLURM | step 0, `--cluster` | `sbatch`, `srun` |
+| [CCP4](https://www.ccp4.ac.uk/) | clean + dimple | `cad`, `mtzdmp`, `dimple` |
+| [PHENIX](https://phenix-online.org/) | difference maps | `phenix.fobs_minus_fobs_map` |
+| [PyMOL](https://pymol.org/) | peak figures | `pymol` |
 
 **Python ≥ 3.10**, with: `numpy`, `pandas`, `scipy`, `gemmi`, `matplotlib`,
-`seaborn`, `wxmplot`, `dask`.
+`seaborn`, `dask`.
 
-### Quick environment setup
+### Environment setup
 
-A helper is provided to build a virtual environment with all Python
-dependencies (it reuses `phenix.python` if available, so `gemmi`/`numpy` come
-for free):
+A helper loads every external tool as a module and activates the Python
+environment. **Source** it once per shell (don't execute it):
 
 ```bash
-bash setup_svd_env.sh
-# then, in any new session:
-source ~/.venv/svd_pipeline/bin/activate
+source scripts/setup_env.sh
 ```
 
 Make the scripts executable once after cloning:
@@ -91,18 +82,20 @@ chmod +x scripts/*.py scripts/*.sh
 
 ## Full walkthrough
 
-Throughout, replace `CaMDH_073` / paths / `PfuGRHPR_006` with your own dataset.
+Throughout, replace `CaMDH_073` / paths / templates with your own dataset.
 
 ### Step 0 — Submit chunked autoPROC jobs
 
-> Run **from the directory containing your CBF images.**
+> Run **from the directory containing your images** (a CBF template or an Eiger
+> HDF5 master file — the mode is detected automatically).
 
-Edit the variables at the top of `scripts/TR-FRX_autoPROC_cbf.sh`:
+Edit the variables at the top of `scripts/TR-FRX_autoPROC.sh` (the exact names
+are documented in the script header):
 
 | Variable | Description | Example |
 |---|---|---|
 | `RUN_ID` | Dataset run number | `006` |
-| `CBF_TEMPLATE` | CBF filename template (`####` = frame number) | `PfuGRHPR_006_1_####.cbf` |
+| `IMAGE_TEMPLATE` | Image template (`####` = frame no.) or HDF5 master | `PfuGRHPR_006_1_####.cbf` |
 | `FIRST_IMG` / `LAST_IMG` | Total frame range | `1` / `3000` |
 | `REF_FIRST_IMG` / `REF_LAST_IMG` | Reference chunk range | `1` / `300` |
 | `CHUNK_SIZE` | Frames per subsequent chunk | `300` |
@@ -115,12 +108,13 @@ Then:
 
 ```bash
 cd /data/images/PfuGRHPR_006
-bash /path/to/TR-FRX-autoprocessing/scripts/TR-FRX_autoPROC_cbf.sh
+bash /path/to/TR-FRX-autoprocessing/scripts/TR-FRX_autoPROC.sh
 ```
 
-It submits one SLURM job for the **reference** chunk (e.g. 1–300), then one
-job per subsequent chunk (301–600, 601–900, …), each depending on the
-reference job. Output lands in `autoproc_chunks/`:
+It submits one SLURM job for the **reference** chunk (e.g. 1–300), then one job
+per subsequent chunk (301–600, 601–900, …), each depending on the reference
+job. Output lands in `autoproc_chunks/`, and a final job regroups the
+statistics into `autoproc_chunks/reports/`:
 
 ```
 autoproc_chunks/
@@ -128,107 +122,78 @@ autoproc_chunks/
     autoPROC_301_600/
     autoPROC_601_900/
     ...
+    reports/              ← consolidated STARANISO / truncate statistics
 ```
 
 Wait for all jobs to finish before continuing.
 
-> **CBF header problems?** If autoPROC complains about missing detector
-> metadata, repair the headers first with
-> `scripts/fix_cbf_headers.py --help` (preview with `--dry-run`).
+### Step 1+ — The full pipeline (one command)
 
-### Step 1 — Collect the useful files
-
-```bash
-./scripts/copy_files.py <source_dir> <destination_dir>
-# e.g.
-./scripts/copy_files.py /data/images/PfuGRHPR_006/autoproc_chunks /data/processed
-```
-
-Scans for `autoPROC_*` folders and copies the key outputs
-(`staraniso_alldata-unique.mtz`, `truncate-unique.mtz`, `summary.html`,
-`report.pdf`, `XDS_ASCII.HKL`, …) into a structured destination, one folder per
-chunk.
-
-### Step 2 — Clean & collect the MTZs
-
-Create a working folder and run the cleaner from inside it:
+Everything downstream is a single script. Point it at your **model**, the
+**autoproc_chunks** folder from Step 0, and an **output** folder:
 
 ```bash
-mkdir /data/processed/PfuGRHPR_006/dFo
-cd    /data/processed/PfuGRHPR_006/dFo
-../../../TR-FRX-autoprocessing/scripts/fetch_clean_mtz.py /data/processed/PfuGRHPR_006 .
+scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
 ```
 
-For each chunk it finds `staraniso_alldata-unique.mtz`, strips it down to
-`H K L F SIGF FreeR_flag` with CCP4 `cad`, and writes a named MTZ:
+It asks for a **dataset name** and whether to use the **staraniso** or
+**truncate** MTZ, then runs, in order:
+
+1. copy the `autoPROC_*` chunks into the output folder,
+2. CAD-clean the chosen MTZ (staraniso **or** truncate) for every timepoint,
+3. `dimple` the reference timepoint against your model → `final.pdb`
+   (its final R is reported; a warning is printed if R > `--max-r`, default 0.4),
+4. `phenix.fobs_minus_fobs_map` for every timepoint against the reference,
+5. **SVD** of the difference-map series + **peak finding** + PyMOL figures + a
+   self-contained **`report.html`**.
+
+**Output layout** — numbered reruns; copy/clean/dimple are shared across reruns:
 
 ```
-dFo/
-    PfuGRHPR_006_1_300.mtz       ← will serve as reference (lowest index)
-    PfuGRHPR_006_301_600.mtz
-    PfuGRHPR_006_601_900.mtz
+/data/processed/PfuGRHPR_006/
+    autoproc_copy/                  # copied chunks (created once)
+    run_01/
+        analysis/                   # cleaned MTZ, final.pdb, output_dfo/, output_svd/
+        dimple/                     # dimple run + its logs
+        pipeline_<stamp>.log        # full console transcript of this run
+        report.html                 # ← open this
+        run_config.txt
+    run_02/  ...                    # each rerun keeps its own folder
 ```
 
-### Step 3 — Add a model, compute Fo–Fo difference maps
-
-Drop your refined model into the `dFo` folder (named `model.pdb` if there are
-several PDBs), then:
+**Handy options** (run `scripts/trfrx_full_pipeline.py -h` for the full list):
 
 ```bash
-cd /data/processed/PfuGRHPR_006/dFo
-/path/to/TR-FRX-autoprocessing/scripts/diffmaps.py
+--name D1                  # skip the dataset-name prompt
+--file staraniso|truncate  # skip the structure-factor-file prompt
+--dry-run                  # print the plan for every stage, do nothing
+--resume                   # reuse the latest run_NN, skip finished work
+--start-stage analyze      # re-run only the analysis (retune) into a new run_NN
+--ref-timepoint 1_300      # choose which timepoint is the reference / dimpled
+--display-sigma 3.0        # peak-figure contour level (sigma)
+--display-near 5.0         # residues shown around each peak (A)
+--cluster                  # dimple via srun + diffmaps via sbatch (SLURM)
 ```
 
-Runs `phenix.fobs_minus_fobs_map` for every MTZ against the
-lowest-index reference. Results go to `dFo/output/`:
-
-```
-dFo/output/
-    dFo_PfuGRHPR_006_301_600-PfuGRHPR_006_1_300_1.mtz
-    dFo_PfuGRHPR_006_301_600-PfuGRHPR_006_1_300_1.map
-    ...
-```
-
-Useful options:
-
-```bash
---dir /path/to/dFo   # run from elsewhere
---high-res 1.8       # high-resolution cutoff (Å)
---low-res  8.0       # low-resolution  cutoff (Å)
---dry-run            # print the plan without running PHENIX
-```
-
-### Step 4 — SVD of the difference-map series
-
-```bash
-/path/to/TR-FRX-autoprocessing/scripts/SVD_all_in_one.py --help
-```
-
-Performs a singular-value decomposition across the Fo–Fo difference-map series
-to separate time-resolved structural signal from noise. See the script's
-`--help` for inputs and options.
+> **On a cluster:** `--cluster` runs `dimple` on a compute node via `srun`
+> (streamed live) and submits the difference maps as parallel `sbatch` jobs; the
+> final job writes `report.html` once every timepoint has finished.
 
 ---
 
 ## Quick reference
 
 ```bash
-# 0. edit variables, submit from the CBF folder
+# once per shell
+source scripts/setup_env.sh
+
+# 0. edit variables, submit from the image folder
 cd /data/images/PfuGRHPR_006
-bash TR-FRX_autoPROC_cbf.sh                 # → wait for SLURM
+bash /path/to/scripts/TR-FRX_autoPROC.sh          # → wait for SLURM
 
-# 1. collect
-./copy_files.py /data/images/PfuGRHPR_006/autoproc_chunks /data/processed
-
-# 2. clean MTZs
-mkdir /data/processed/PfuGRHPR_006/dFo && cd $_
-./fetch_clean_mtz.py /data/processed/PfuGRHPR_006 .
-
-# 3. add model.pdb, then difference maps
-./diffmaps.py
-
-# 4. SVD
-./SVD_all_in_one.py
+# 1+. everything else, one command
+scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
+#     → /data/processed/PfuGRHPR_006/run_01/report.html
 ```
 
 ---
