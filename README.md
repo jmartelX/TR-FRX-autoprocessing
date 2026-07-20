@@ -72,6 +72,12 @@ environment. **Source** it once per shell (don't execute it):
 source scripts/setup_env.sh
 ```
 
+> **Use two terminals.** `setup_env.sh` is only needed for the pipeline
+> (Step 1+). Run the autoPROC step (Step 0) in its **own, plain** terminal, and
+> the pipeline in a **separate** terminal where you have sourced `setup_env.sh`
+> — the pipeline environment (PHENIX/CCP4/PyMOL modules + virtualenv) can
+> otherwise interfere with autoPROC's own module setup.
+
 Make the scripts executable once after cloning:
 
 ```bash
@@ -189,14 +195,13 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 ## Quick reference
 
 ```bash
-# once per shell
-source scripts/setup_env.sh
-
-# 0. edit variables, submit from the image folder
+# ── Terminal 1 · plain shell ─────────────────────────────
+# 0. edit variables, then submit autoPROC from the image folder
 cd /data/images/PfuGRHPR_006
 bash /path/to/scripts/TR-FRX_autoPROC.sh          # → wait for SLURM
 
-# 1+. everything else, one command
+# ── Terminal 2 · pipeline environment ────────────────────
+source scripts/setup_env.sh
 scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
 #     → /data/processed/PfuGRHPR_006/run_01/report.html
 ```
