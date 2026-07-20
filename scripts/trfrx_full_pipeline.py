@@ -78,6 +78,8 @@ MESH_CARVE    = 1.8     # A — tight cage hugging the shown atoms (validation l
 # "lone" atoms of interest — waters + common ions — shown as spheres and labelled
 # (they have no bonds, so `show sticks` alone would leave them invisible).
 _LONE_SEL = "(resn HOH or elem Na+K+Mg+Ca+Mn+Fe+Zn+Cu+Ni+Co+Cd+Cl+Br+I)"
+# Ions / single atoms of interest (waters EXCLUDED) — these get a name label.
+_ION_SEL  = "(elem Na+K+Mg+Ca+Mn+Fe+Zn+Cu+Ni+Co+Cd+Cl+Br+I)"
 
 # Signal-to-noise: noise floor is estimated from density further than
 # SOLVENT_DIST from any atom (bulk solvent); signal from the top-N near peaks.
@@ -1196,12 +1198,15 @@ def find_persistent_sites(dfo_results: list[dict], radius: float) -> list[dict]:
             order, p = ref[idx]
             by_order.setdefault(order, []).append(abs(p.sigma))
         orders = sorted(by_order)
+        n_tp   = len(orders)
+        if n_tp < 2:
+            continue          # seen in only one map -> not a "persistent" site
         seq    = [max(by_order[o]) for o in orders]
         best_i = max(members, key=lambda i: abs(ref[i][1].sigma))
         sites.append({
             "short":       ref[best_i][1].short_label,
-            "n_tp":        len(orders),
-            "persistence": len(orders) / total if total else 0.0,
+            "n_tp":        n_tp,
+            "persistence": n_tp / total if total else 0.0,
             "trend":       _classify_trend(orders, seq),
             "max_sigma":   max(abs(ref[i][1].sigma) for i in members),
         })
@@ -1292,8 +1297,11 @@ def build_pymol_script(model_path: Path, ccp4_path: Path, peaks: list[Peak],
             # a small marker at the peak centre so the eye finds it immediately
             "cmd.show('nonbonded', 'pk')",
             "cmd.color('yellow', 'pk')",
-            "cmd.label('near and enzyme and name CA', '\"%s%s\" % (resn, resi)')",
-            "cmd.label('lone', '\"%s%s\" % (resn, resi)')",
+            # fresh labels each frame: residue names (protein Cα, one per residue)
+            # and ion / single-atom names — never waters.
+            "cmd.label('all', '')",
+            "cmd.label('near and polymer and name CA', '\"%s%s\" % (resn, resi)')",
+            f"cmd.label('near and {_ION_SEL}', '\"%s%s\" % (resn, resi)')",
             # consistent framing: orient on the local scene, then fit around the peak
             "cmd.orient('near or pk')",
             f"cmd.zoom('pk', {carve_r + 2.5:.2f})",
