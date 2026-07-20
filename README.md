@@ -111,6 +111,11 @@ cd /data/images/PfuGRHPR_006
 bash /path/to/TR-FRX-autoprocessing/scripts/TR-FRX_autoPROC.sh
 ```
 
+> **Separate input / output folders?** Instead of `cd`-ing into the image
+> folder, pass them as arguments —
+> `./TR-FRX_autoPROC.sh <input_dir> <output_dir>` — and, if needed, override the
+> detected input file: `./TR-FRX_autoPROC.sh <input_dir> <output_dir> master.h5`.
+
 It submits one SLURM job for the **reference** chunk (e.g. 1–300), then one job
 per subsequent chunk (301–600, 601–900, …), each depending on the reference
 job. Output lands in `autoproc_chunks/`, and a final job regroups the
