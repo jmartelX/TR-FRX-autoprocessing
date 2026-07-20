@@ -3,7 +3,7 @@
 A reproducible command-line pipeline for processing **Time-Resolved Functional
 Rotation Crystallography (TR-FRX)** data — from raw diffraction images all the
 way to **Fo–Fo difference maps**, their **singular-value decomposition (SVD)**
-and an automated **peak analysis**, in a single command.
+and an automated **peak analysis**.
 
 TR-FRX captures real-time structural snapshots of ligand binding and enzymatic
 catalysis in **single protein crystals at room temperature**, using standard
@@ -26,7 +26,7 @@ well-established crystallography software (autoPROC, CCP4, PHENIX, PyMOL) with a
 small set of Python/shell tools so an entire time-resolved dataset can be
 processed with **two commands**.
 
-> Throughout this documentation, **"chunk" = "subdataset" = one time point** —
+> Throughout this documentation, **"chunk" = "subdataset" = one time window** —
 > a complete sub-dataset extracted from the continuous rotation collection.
 
 See the associated paper for the method itself ([Citing this
@@ -72,6 +72,7 @@ environment. **Source** it once per shell (don't execute it):
 source scripts/setup_env.sh
 ```
 
+> [!IMPORTANT]
 > **Use two terminals.** `setup_env.sh` is only needed for the pipeline
 > (Step 1+). Run the autoPROC step (Step 0) in its **own, plain** terminal, and
 > the pipeline in a **separate** terminal where you have sourced `setup_env.sh`
@@ -88,7 +89,7 @@ chmod +x scripts/*.py scripts/*.sh
 
 ## Full walkthrough
 
-Throughout, replace `CaMDH_073` / paths / templates with your own dataset.
+Throughout, replace `CaMDH_001` / paths / templates with your own dataset.
 
 ### Step 0 — Submit chunked autoPROC jobs
 
@@ -100,27 +101,30 @@ are documented in the script header):
 
 | Variable | Description | Example |
 |---|---|---|
-| `RUN_ID` | Dataset run number | `006` |
-| `IMAGE_TEMPLATE` | Image template (`####` = frame no.) or HDF5 master | `PfuGRHPR_006_1_####.cbf` |
+| `RUN_ID` | Dataset run number | `001` |
+| `IMAGE_TEMPLATE` | Image template (`####` = frame no.) or HDF5 master | `CaMDH_001_1_####.cbf` |
 | `FIRST_IMG` / `LAST_IMG` | Total frame range | `1` / `3000` |
 | `REF_FIRST_IMG` / `REF_LAST_IMG` | Reference chunk range | `1` / `300` |
 | `CHUNK_SIZE` | Frames per subsequent chunk | `300` |
-| `SYMM` | Space group | `I41` |
-| `CELL` | Unit-cell parameters | `114 114 118 90 90 90` |
+| `SYMM` | Space group | `P3121` |
+| `CELL` | Unit-cell parameters | `107 107 103 90 90 120` |
 | `SLURM_PARTITION` | SLURM partition | `nice` |
 | `SLURM_CPUS` / `SLURM_MEM` | Resources per job | `24` / `24000` |
 
 Then:
 
 ```bash
-cd /data/images/PfuGRHPR_006
-bash /path/to/TR-FRX-autoprocessing/scripts/TR-FRX_autoPROC.sh
+cd /data/images/CaMDH_001
+./path/to/TR-FRX-autoprocessing/scripts/TR-FRX_autoPROC.sh
 ```
 
+> [!TIP]
 > **Separate input / output folders?** Instead of `cd`-ing into the image
-> folder, pass them as arguments —
-> `./TR-FRX_autoPROC.sh <input_dir> <output_dir>` — and, if needed, override the
-> detected input file: `./TR-FRX_autoPROC.sh <input_dir> <output_dir> master.h5`.
+> folder, pass them as arguments:
+>
+> ```bash
+> ./TR-FRX_autoPROC.sh <input_dir> <output_dir>
+> ```
 
 It submits one SLURM job for the **reference** chunk (e.g. 1–300), then one job
 per subsequent chunk (301–600, 601–900, …), each depending on the reference
@@ -136,15 +140,18 @@ autoproc_chunks/
     reports/              ← consolidated STARANISO / truncate statistics
 ```
 
-Wait for all jobs to finish before continuing.
+> [!CAUTION]
+> **Wait for all jobs to finish before continuing.**
 
 ### Step 1+ — The full pipeline (one command)
+
+**USE IN A TERMINAL WITH THE ENV ACTIVATED**
 
 Everything downstream is a single script. Point it at your **model**, the
 **autoproc_chunks** folder from Step 0, and an **output** folder:
 
 ```bash
-scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
+python path/to/scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  ./
 ```
 
 It asks for a **dataset name** and whether to use the **staraniso** or
@@ -175,6 +182,7 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 **Handy options** (run `scripts/trfrx_full_pipeline.py -h` for the full list):
 
 ```bash
+--cluster                  # dimple via srun + diffmaps via sbatch (SLURM)
 --name D1                  # skip the dataset-name prompt
 --file staraniso|truncate  # skip the structure-factor-file prompt
 --dry-run                  # print the plan for every stage, do nothing
@@ -183,9 +191,10 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 --ref-timepoint 1_300      # choose which timepoint is the reference / dimpled
 --display-sigma 3.0        # peak-figure contour level (sigma)
 --display-near 5.0         # residues shown around each peak (A)
---cluster                  # dimple via srun + diffmaps via sbatch (SLURM)
+
 ```
 
+> [!IMPORTANT]
 > **On a cluster:** `--cluster` runs `dimple` on a compute node via `srun`
 > (streamed live) and submits the difference maps as parallel `sbatch` jobs; the
 > final job writes `report.html` once every timepoint has finished.
@@ -202,7 +211,7 @@ bash /path/to/scripts/TR-FRX_autoPROC.sh          # → wait for SLURM
 
 # ── Terminal 2 · pipeline environment ────────────────────
 source scripts/setup_env.sh
-scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
+python scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
 #     → /data/processed/PfuGRHPR_006/run_01/report.html
 ```
 
