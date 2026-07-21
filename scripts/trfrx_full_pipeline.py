@@ -14,8 +14,9 @@ It merges three scripts into one self-contained tool:
 are reused verbatim: pathlib.Path throughout, argparse CLI, --dry-run support,
 the MTZ trailing-index regexes, and the label / resolution auto-detection helpers.
 
-At startup you are asked whether to use the staraniso or the truncate MTZ; that
-choice drives BOTH dimple and the cleaning step (use --file to skip the prompt).
+At startup you are asked whether to use the truncate (default) or the staraniso
+MTZ; that choice drives BOTH dimple and the cleaning step (use --file to skip
+the prompt).
 
 Difference maps go to   ./output_dfo/
 SVD output goes to      ./output_svd/
@@ -2330,20 +2331,20 @@ def prompt_name(cli_name, default: str) -> str:
 
 
 def prompt_file_choice(cli_choice) -> str:
-    """staraniso vs truncate — the CLI flag if given, else ask (default staraniso)."""
+    """truncate vs staraniso — the CLI flag if given, else ask (default truncate)."""
     if cli_choice:
         return cli_choice
     if not sys.stdin.isatty():
-        print("Non-interactive input: defaulting to staraniso.")
-        return "staraniso"
+        print("Non-interactive input: defaulting to truncate.")
+        return "truncate"
     while True:
-        ans = input("Which structure factors? [s]taraniso / [t]runcate "
-                    "(default s): ").strip().lower()
-        if ans in ("", "s", "staraniso"):
-            return "staraniso"
-        if ans in ("t", "truncate"):
+        ans = input("Which structure factors? [t]runcate / [s]taraniso "
+                    "(default t): ").strip().lower()
+        if ans in ("", "t", "truncate"):
             return "truncate"
-        print("  Please answer 's' or 't'.")
+        if ans in ("s", "staraniso"):
+            return "staraniso"
+        print("  Please answer 't' or 's'.")
 
 
 def _dry_run_plan(chunks: Path, base_name: str, analysis: Path, dimple_dir: Path,
