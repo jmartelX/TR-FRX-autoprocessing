@@ -527,6 +527,55 @@ def print_resolution_table(res_values: dict[str, float]) -> None:
         print(f"  {r:>8.3f}   {name}")
 
 
+# ── Interactive prompt helpers — never crash on an unexpected answer ─────
+def _ask(prompt: str) -> str:
+    """input() that survives Ctrl-D / a closed stdin (returns '' instead of raising)."""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print()
+        return ""
+
+
+def ask_float(prompt: str, default: float,
+              lo: float = None, hi: float = None) -> float:
+    """Ask for a number, re-asking until it parses instead of crashing.
+
+    Accepts a comma decimal separator ('2,2' -> 2.2). An empty answer keeps
+    *default*; values outside optional lo/hi bounds are re-asked too.
+    """
+    while True:
+        ans = _ask(prompt)
+        if not ans:
+            return default
+        try:
+            val = float(ans.replace(",", "."))
+        except ValueError:
+            print(f"  '{ans}' is not a number — e.g. 2.2 "
+                  f"(or press Enter for {default:g}).")
+            continue
+        if (lo is not None and val < lo) or (hi is not None and val > hi):
+            print(f"  Please give a value between {lo:g} and {hi:g}.")
+            continue
+        return val
+
+
+def ask_yes_no(prompt: str, default: bool = False) -> bool:
+    """Ask a yes/no question, re-asking until the answer is understood.
+
+    Empty answer -> *default*. Accepts y/yes/o/oui and n/no/non.
+    """
+    while True:
+        ans = _ask(prompt).lower()
+        if not ans:
+            return default
+        if ans in ("y", "yes", "o", "oui"):
+            return True
+        if ans in ("n", "no", "non"):
+            return False
+        print("  Please answer 'y' (yes) or 'n' (no).")
+
+
 def prompt_resolution_choice(mtz_files: list[Path],
                              res_values: dict[str, float],
                              interactive: bool) -> tuple[float, list[Path]]:
@@ -547,13 +596,10 @@ def prompt_resolution_choice(mtz_files: list[Path],
     print_resolution_table(res_values)
     print(f"\nWorst (common) resolution = {worst:.3f} A  ({worst_name})")
 
-    # Prompt 1 — cutoff
-    try:
-        ans = input(f"High-resolution cutoff for ALL maps in A "
-                    f"[Enter = {worst:.3f}]: ").strip()
-    except EOFError:
-        ans = ""
-    reslim = float(ans) if ans else worst
+    # Prompt 1 — cutoff (re-asks on anything that isn't a number; '2,2' works)
+    reslim = ask_float(f"High-resolution cutoff for ALL maps in A "
+                       f"[Enter = {worst:.3f}]: ",
+                       default=worst, lo=0.1, hi=999.0)
 
     # Prompt 2 — drop worse files
     droppable = {n: r for n, r in res_values.items() if r > reslim + 1e-6}
@@ -562,11 +608,7 @@ def prompt_resolution_choice(mtz_files: list[Path],
         print("These files are worse than the chosen cutoff:")
         for n, r in sorted(droppable.items(), key=lambda x: -x[1]):
             print(f"    {r:.3f} A  {n}")
-        try:
-            drop = input("Drop them before proceeding? [y/N]: ").strip().lower()
-        except EOFError:
-            drop = ""
-        if drop.startswith("y"):
+        if ask_yes_no("Drop them before proceeding? [y/N]: ", default=False):
             kept = [m for m in mtz_files if m.name not in droppable]
             print(f"  Dropped {len(droppable)} file(s); {len(kept)} remain.")
     return reslim, kept
@@ -2322,7 +2364,7 @@ def prompt_name(cli_name, default: str) -> str:
         print(f"Non-interactive input: using dataset name '{default}'.")
         return default
     while True:
-        ans = input(f"Dataset name for this run [Enter = {default}]: ").strip()
+        ans = _ask(f"Dataset name for this run [Enter = {default}]: ")
         name = ans or default
         # Keep it filesystem-safe (it becomes a folder name and a filename prefix).
         if name and "/" not in name and name not in (".", ".."):
@@ -2338,8 +2380,8 @@ def prompt_file_choice(cli_choice) -> str:
         print("Non-interactive input: defaulting to truncate.")
         return "truncate"
     while True:
-        ans = input("Which structure factors? [t]runcate / [s]taraniso "
-                    "(default t): ").strip().lower()
+        ans = _ask("Which structure factors? [t]runcate / [s]taraniso "
+                   "(default t): ").lower()
         if ans in ("", "t", "truncate"):
             return "truncate"
         if ans in ("s", "staraniso"):
