@@ -12,7 +12,9 @@
 #     staraniso_report.pdf   staraniso_statistics.csv   (STARANISO route)
 #     truncate_report.pdf    truncate_statistics.csv    (classical autoPROC)
 #     parsing_diagnostics.txt
-# including how many images were used and which image ranges.
+# Each PDF holds radiation-damage plots vs image number (high-resolution limit,
+# R-factors, I/sigma, CC(1/2), Wilson B, unit-cell edges & volume, images used)
+# plus per-chunk statistics tables, and records which image ranges were used.
 #
 # Usage:
 #   # Old way (run from the directory containing the images / master file):
@@ -157,48 +159,70 @@ done
 # =====================================================================
 # --- Générateur de rapports (écrit dans PROCESS_DIR, puis lancé) ------
 # =====================================================================
-cat > "$PROCESS_DIR/autoproc_reports.py" <<'PYEOF'
+cat > "$PROCESS_DIR/trfrx_damage_report.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""Consolidate autoPROC chunk statistics into per-route reports.
+"""TR-FRX radiation-damage report from autoPROC chunk statistics.
+
+Standalone tool (development version — not yet wired into TR-FRX_autoPROC.sh).
+Run it after processing, pointed at an existing ``autoproc_chunks`` directory:
+
+    python trfrx_damage_report.py --process-dir /path/to/autoproc_chunks
+    python trfrx_damage_report.py --process-dir ... --dataset CaMDH_012
+
+It needs only libraries already provided by setup_env.sh (matplotlib, gemmi,
+numpy for the plots / Wilson-B / R_d; the CSV and scraped stats work with the
+Python standard library alone). Every optional dependency is imported
+defensively, so a missing one degrades to a warning rather than a crash.
 
 For a given ``autoproc_chunks`` directory (the PROCESS_DIR created by
 TR-FRX_autoPROC.sh), this script scans every ``autoPROC_<first>_<last>`` chunk
 sub-directory, extracts the final merging statistics for both processing routes
-and writes, into a ``reports/`` sub-folder:
+(STARANISO and classical TRUNCATE) and writes, into a ``reports/`` sub-folder:
 
     reports/staraniso_statistics.csv   reports/staraniso_report.pdf
     reports/truncate_statistics.csv    reports/truncate_report.pdf
     reports/parsing_diagnostics.txt
 
-* "staraniso" = the STARANISO (anisotropy-corrected) route.
-* "truncate"  = the classical autoPROC route (truncate-unique.mtz).
+Because TR-FRX processes successive image ranges ("chunks") that accumulate
+dose, each chunk is a dose point. The reports therefore plot a set of
+*radiation-damage* indicators as a function of the mean image number (a dose
+proxy):
 
-Each report also records how many images were used and which image ranges
-(derived from the chunk directory names) went into the merge.
+    * High-resolution limit vs dose               (rising = damage)
+    * R_merge / R_meas / R_pim vs dose            (rising = damage)
+    * Mean I/sigma(I) vs dose                     (falling = damage)
+    * CC(1/2) vs dose                             (falling = damage)
+    * Wilson B-factor and its increase dB vs dose (rising = loss of
+      high-resolution order; the global B-factor "scaling"/decay curve)
+    * Unit-cell edges and volume, % change vs dose (expansion = damage)
+    * Cross-sweep R_d vs dose                      (rising = damage)
+    * Images actually used per chunk vs dose
 
-The statistics are read from the AIMLESS-style "Summary data" table that
-autoPROC writes into its log files. Any statistic that cannot be found is
-reported as ``N/A`` rather than causing a failure; the diagnostics file lists
-every candidate file that was scanned so the parser can be tightened if a site
-uses non-standard filenames.
+Scalar statistics come from the AIMLESS "Summary data" tables and the per-route
+``*.table1`` files. Unit cells are scraped from the same files. The Wilson
+B-factor is scraped when autoPROC prints it and otherwise estimated directly
+from the merged MTZ (relative B: the offset from omitting the atomic scattering
+term cancels in dB across chunks). The cross-sweep R_d and the Wilson B both use
+``gemmi`` to read the merged MTZs.
 
-Usage:
-    python autoproc_reports.py --process-dir /path/to/autoproc_chunks
+Any statistic that cannot be found is reported as ``N/A`` rather than causing a
+failure; parsing_diagnostics.txt lists every file scanned and value picked so
+the parser can be tightened for non-standard filenames.
 """
 
 import argparse
 import csv
 import datetime
+import math
 import os
 import re
 import sys
 
 
 # --------------------------------------------------------------------------
-# Statistics extracted for the consolidated "Table 1" style report.
-# Each entry: (csv_column, [keywords that must appear in the AIMLESS label],
-#              [keywords that must NOT appear], want_outer_shell)
-# Labels are matched case-insensitively against the AIMLESS row label.
+# Statistics extracted from the AIMLESS/table1 "Overall InnerShell OuterShell"
+# rows. Each entry: (csv_column, [keywords that must appear in the label],
+#                    [keywords that must NOT appear], want_outer_shell)
 # --------------------------------------------------------------------------
 METRICS = [
     ("resolution_low",        ["low resolution"],              [],            False),
@@ -208,10 +232,6 @@ METRICS = [
     ("Rpim",                  ["rpim", "all"],                 [],            True),
     ("Mean_I_over_sigma",     ["mean", "sd(i)"],               [],            True),
     ("CC_half",               ["cc(1/2)"],                     [],            True),
-    # STARANISO reports both spherical and ellipsoidal completeness; the
-    # classical route reports a single "Completeness" (matched by the spherical
-    # rows too, since it carries neither keyword). "ellipsoidal" is therefore
-    # N/A for the classical route.
     ("Completeness",              ["completeness"],                           ["anomalous", "ellipsoidal"], True),
     ("Completeness_ellipsoidal",  ["completeness", "ellipsoidal"],            ["anomalous"],                True),
     ("Multiplicity",              ["multiplicity"],                           ["anomalous"],                True),
@@ -226,10 +246,60 @@ NUM = r"[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?"
 ROW_RE = re.compile(r"^\s*(.*?)\s+(%s)\s+(%s)\s+(%s)\s*$" % (NUM, NUM, NUM))
 CHUNK_RE = re.compile(r"^autoPROC_(\d+)_(\d+)$")
 
+# Wilson B-factor — several autoPROC/CTRUNCATE/STARANISO phrasings.
+WILSON_RES = [
+    re.compile(r"wilson\s*b[- ]?factor[^0-9\-+]*(%s)" % NUM, re.I),
+    re.compile(r"\bb[- ]?wilson\b[^0-9\-+]*(%s)" % NUM, re.I),
+    re.compile(r"wilson\s*plot[^0-9]*?b[- ]?factor[^0-9\-+]*(%s)" % NUM, re.I),
+    re.compile(r"estimated\s+b[- ]?factor[^0-9\-+]*(%s)" % NUM, re.I),
+]
+# Six cell parameters after a "unit cell" / "average unit cell" marker.
+CELL6 = r"(%s)[ \t]+(%s)[ \t]+(%s)[ \t]+(%s)[ \t]+(%s)[ \t]+(%s)" % ((NUM,) * 6)
+CELL_AVG_RE = re.compile(r"average\s+unit\s+cell[^\n]*?" + CELL6, re.I)
+CELL_ANY_RE = re.compile(r"unit[- ]cell[^\n]*?" + CELL6, re.I)
+
+# Real number of images that survived into scaling (autoPROC/XDS reject some).
+# AIMLESS batch count is the primary source (1 batch ~ 1 image); XDS logs back
+# it up. Every match is recorded in the diagnostics so the source is auditable.
+IMAGES_USED_RES = [
+    ("aimless-batches", re.compile(r"number\s+of\s+batches\s*[:=]?\s*(\d+)", re.I)),
+    ("images-used",     re.compile(r"number\s+of\s+images\s+used\s*[:=]?\s*(\d+)", re.I)),
+    ("images-accepted", re.compile(r"images\s+(?:used|accepted)\s*[:=]?\s*(\d+)", re.I)),
+    ("xds-of-images",   re.compile(r"of\s+(\d+)\s+images", re.I)),
+]
+
+
+def to_float(value):
+    """Best-effort conversion of a scraped statistic to float, else None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if text == "" or text.upper() == "N/A" or set(text) <= set("-"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        m = re.search(NUM, text)
+        return float(m.group()) if m else None
+
+
+def cell_volume(cell):
+    """Triclinic unit-cell volume from (a, b, c, alpha, beta, gamma) in deg."""
+    if not cell or any(v is None for v in cell):
+        return None
+    a, b, c, al, be, ga = cell
+    ca, cb, cg = (math.cos(math.radians(x)) for x in (al, be, ga))
+    fac = 1 - ca * ca - cb * cb - cg * cg + 2 * ca * cb * cg
+    if fac <= 0:
+        return None
+    return a * b * c * math.sqrt(fac)
+
 
 def find_summary_blocks(text):
-    """Return a list of {'title', 'metrics'} for every AIMLESS Summary data
-    table found in *text*. metrics maps label -> (overall, inner, outer)."""
+    """Return [{'title', 'metrics'}] for every AIMLESS Summary data table in
+    *text*. metrics maps label -> (overall, inner, outer)."""
     lines = text.splitlines()
     n = len(lines)
     blocks = []
@@ -237,7 +307,6 @@ def find_summary_blocks(text):
     while i < n:
         if "Summary data for" in lines[i]:
             title = lines[i].strip()
-            # Locate the "Overall  InnerShell  OuterShell" header nearby.
             header = None
             for j in range(i + 1, min(i + 12, n)):
                 if "Overall" in lines[j] and ("Shell" in lines[j] or "Low" in lines[j]):
@@ -249,20 +318,12 @@ def find_summary_blocks(text):
                 while k < n:
                     line = lines[k]
                     stripped = line.strip()
-                    # End of the summary table. AIMLESS closes it with a
-                    # "$$ <!--SUMMARY_END-->" line; the free-text sections that
-                    # follow ("Estimates of resolution limits", "Average unit
-                    # cell", ...) contain stray numbers we must NOT parse.
                     if (stripped.startswith("$$")
                             or "SUMMARY_END" in stripped
                             or stripped.startswith("====")
                             or stripped.startswith("Estimates of resolution")
                             or "Summary data for" in line):
                         break
-                    # Rows like "Rmerge in top intensity bin  0.255  -  -" carry
-                    # dashes instead of 3 numbers: skip them WITHOUT ending the
-                    # table (the old code stopped here and lost CC(1/2),
-                    # completeness, multiplicity, anomalous stats, ...).
                     m = ROW_RE.match(line)
                     if m:
                         label = re.sub(r"\s+", " ", m.group(1).strip())
@@ -281,13 +342,7 @@ def is_staraniso(path, title):
 
 
 def parse_table1(text):
-    """Parse an autoPROC/Global-Phasing ``*.table1`` summary file.
-
-    These files hold the official per-route "Table 1" statistics as a simple
-    ``label  Overall  InnerShell  OuterShell`` table under an
-    "Overall InnerShell OuterShell" header. Returns a metrics dict
-    label -> (overall, inner, outer), or {} if no table is found.
-    """
+    """Parse a ``*.table1`` (label Overall InnerShell OuterShell) file."""
     lines = text.splitlines()
     header = None
     for idx, line in enumerate(lines):
@@ -299,7 +354,7 @@ def parse_table1(text):
     metrics = {}
     for line in lines[header + 1:]:
         stripped = line.strip()
-        if not stripped or set(stripped) <= set("-"):   # blank or "----" rule
+        if not stripped or set(stripped) <= set("-"):
             continue
         m = ROW_RE.match(line)
         if m:
@@ -309,17 +364,42 @@ def parse_table1(text):
     return metrics
 
 
-def source_priority(fname):
-    """Higher = more authoritative source for the merging statistics.
+def scrape_wilson_b(text):
+    """Return the last Wilson B-factor mentioned in *text*, or None."""
+    best = None
+    for rex in WILSON_RES:
+        found = rex.findall(text)
+        if found:
+            best = to_float(found[-1])
+    return best
 
-    autoPROC's per-route ``*-unique.table1`` files are the official Table-1
-    summaries and are preferred over scraping AIMLESS logs; the plain
-    ``aimless.log`` is preferred over the ``_early``/``_late`` (radiation-damage
-    half-sets) and ``_alldata`` variants."""
+
+def scrape_cell(text):
+    """Return (a, b, c, al, be, ga) preferring an 'Average unit cell' line."""
+    m = CELL_AVG_RE.search(text) or CELL_ANY_RE.search(text)
+    if not m:
+        return None
+    cell = tuple(to_float(g) for g in m.groups())
+    if any(v is None or v <= 0 for v in cell):
+        return None
+    return cell
+
+
+def scrape_images_used(text):
+    """Return (n_images_used, source_tag) or (None, None)."""
+    for tag, rex in IMAGES_USED_RES:
+        m = rex.search(text)
+        if m:
+            return int(m.group(1)), tag
+    return None, None
+
+
+def source_priority(fname):
+    """Higher = more authoritative source for the merging statistics."""
     f = fname.lower()
     if f in ("truncate-unique.table1", "staraniso_alldata-unique.table1"):
         return 100
-    if f.endswith("-unique.table1"):        # e.g. aimless_alldata-unique.table1
+    if f.endswith("-unique.table1"):
         return 60
     if f.endswith(".table1"):
         return 40
@@ -333,46 +413,98 @@ def source_priority(fname):
 
 
 def collect_chunk_blocks(chunk_dir, diagnostics):
-    """Scan a chunk directory and return the best (truncate, staraniso) metrics.
-
-    Both ``*.table1`` files (preferred) and ``*.log`` AIMLESS summaries are
-    considered; the route is taken from the filename ("staraniso" vs anything
-    else) and the highest-priority source wins (ties break on metric count)."""
+    """Scan a chunk directory and return the best (truncate, staraniso) data:
+    merging metrics, unit cell, merged-MTZ path and images-used count."""
     best = {"truncate": None, "staraniso": None}
     best_rank = {"truncate": (-1, -1), "staraniso": (-1, -1)}
+    extra = {r: {"cell": None, "mtz": None, "wilson_b": None, "images_used": None,
+                 "cell_rank": -1, "mtz_rank": -1, "wb_rank": -1, "img_rank": -1}
+             for r in ("truncate", "staraniso")}
 
     def consider(route, metrics, fname, rel):
         if not metrics:
             return
         diagnostics.append("    [%s] %s (%d metrics) <- %s"
-                           % (route, os.path.basename(chunk_dir),
-                              len(metrics), rel))
+                           % (route, os.path.basename(chunk_dir), len(metrics), rel))
         rank = (source_priority(fname), len(metrics))
         if rank > best_rank[route]:
             best_rank[route] = rank
             best[route] = {"metrics": metrics, "source": rel}
 
+    def consider_extra(route, fname, rel, cell, wilson, images):
+        prio = source_priority(fname)
+        e = extra[route]
+        if cell is not None and prio > e["cell_rank"]:
+            e["cell"], e["cell_rank"] = cell, prio
+        # Wilson B: penalise the _early/_late radiation-damage half-sets so the
+        # full-data value (e.g. truncate.log) wins over truncate_late.log.
+        wb_prio = prio - 3 if ("_late" in fname.lower()
+                               or "_early" in fname.lower()) else prio
+        if wilson is not None and wb_prio > e["wb_rank"]:
+            e["wilson_b"], e["wb_rank"] = wilson, wb_prio
+            diagnostics.append("    [%s] Wilson B = %s <- %s (scraped)"
+                               % (route, wilson, rel))
+        if images is not None:
+            n, tag = images
+            # Prefer AIMLESS batch count; keep the first plausible hit.
+            weight = {"aimless-batches": 3, "images-used": 2,
+                      "images-accepted": 2, "xds-of-images": 1}.get(tag, 0)
+            if weight > e["img_rank"]:
+                e["images_used"], e["img_rank"] = n, weight
+                diagnostics.append("    [%s] images used = %d <- %s (%s)"
+                                   % (route, n, rel, tag))
+
+    def consider_mtz(route, fname, fpath):
+        prio = 100 if fname.lower().endswith("-unique.mtz") else 50
+        e = extra[route]
+        if prio > e["mtz_rank"]:
+            e["mtz"], e["mtz_rank"] = fpath, prio
+
     for root, _dirs, files in os.walk(chunk_dir):
         for fname in files:
             low = fname.lower()
-            if not (low.endswith(".table1") or low.endswith(".log")):
-                continue
             fpath = os.path.join(root, fname)
             rel = os.path.relpath(fpath, chunk_dir)
+            if low.endswith(".mtz"):
+                route = "staraniso" if "staraniso" in low else "truncate"
+                consider_mtz(route, fname, fpath)
+                continue
+            if not (low.endswith(".table1") or low.endswith(".log")
+                    or low.endswith(".lp")):
+                continue
             try:
                 with open(fpath, "r", errors="replace") as fh:
-                    text = fh.read()
+                    text = fh.read(2_000_000)     # cap: XDS .LP can be huge
             except (IOError, OSError):
                 continue
+            route_of_file = "staraniso" if "staraniso" in low else "truncate"
+            cell = scrape_cell(text)
+            wilson = scrape_wilson_b(text)
+            images = scrape_images_used(text)
+            images = images if images[0] is not None else None
+            # Unit cell / images used are route-agnostic — record for both so the
+            # STARANISO route is not left blank when only a truncate log has them.
+            for r in ("truncate", "staraniso"):
+                consider_extra(r, fname, rel, cell,
+                               wilson if r == route_of_file else None, images)
             if low.endswith(".table1"):
-                route = "staraniso" if "staraniso" in low else "truncate"
-                consider(route, parse_table1(text), fname, rel)
-            else:  # .log
+                consider(route_of_file, parse_table1(text), fname, rel)
+            elif low.endswith(".log"):
                 for block in find_summary_blocks(text):
                     route = ("staraniso" if is_staraniso(fpath, block["title"])
                              else "truncate")
                     consider(route, block["metrics"], fname, rel)
-    return best
+
+    result = {}
+    for route in ("truncate", "staraniso"):
+        data = best[route] or {"metrics": {}, "source": "N/A"}
+        e = extra[route]
+        data.update({"cell": e["cell"], "mtz": e["mtz"],
+                     "wilson_b": e["wilson_b"], "images_used": e["images_used"]})
+        has_any = (best[route] or e["cell"] or e["mtz"]
+                   or e["wilson_b"] is not None or e["images_used"] is not None)
+        result[route] = data if has_any else None
+    return result
 
 
 def match_metric(metrics, must, mustnot):
@@ -383,22 +515,28 @@ def match_metric(metrics, must, mustnot):
     return None
 
 
-def build_row(chunk_name, first, last, block):
+def build_row(chunk_name, first, last, block, wilson_b, images_used):
     """Return an ordered list of (column, value) for one chunk."""
     row = [
         ("chunk", chunk_name),
         ("image_first", first),
         ("image_last", last),
         ("n_images", last - first + 1),
+        ("images_used", images_used if images_used is not None else "N/A"),
     ]
     metrics = block["metrics"] if block else {}
     for col, must, mustnot, want_outer in METRICS:
         values = match_metric(metrics, must, mustnot)
-        overall = values[0] if values else "N/A"
-        row.append((col, overall))
+        row.append((col, values[0] if values else "N/A"))
         if want_outer:
-            outer = values[2] if values else "N/A"
-            row.append((col + "_outer", outer))
+            row.append((col + "_outer", values[2] if values else "N/A"))
+    cell = block.get("cell") if block else None
+    vol = cell_volume(cell) if cell else None
+    row.append(("Wilson_B", "%.2f" % wilson_b if wilson_b is not None else "N/A"))
+    names = ["cell_a", "cell_b", "cell_c", "cell_al", "cell_be", "cell_ga"]
+    for idx, nm in enumerate(names):
+        row.append((nm, "%.3f" % cell[idx] if cell else "N/A"))
+    row.append(("cell_volume", "%.1f" % vol if vol is not None else "N/A"))
     row.append(("source_file", block["source"] if block else "N/A"))
     return row
 
@@ -416,9 +554,330 @@ def write_csv(path, rows):
         writer.writerows(rows_out)
 
 
-def write_pdf(path, title, rows, image_summary):
-    """Render a multi-page PDF: an image-usage page plus statistics tables.
-    Falls back gracefully (no PDF, only a warning) if matplotlib is absent."""
+# --------------------------------------------------------------------------
+# gemmi-based quantities: Wilson B (from merged intensities) and cross-sweep R_d.
+# --------------------------------------------------------------------------
+def _read_mtz_intensities(mtz_path):
+    """Return (miller_dict {(h,k,l): I}, inv_d2_array, I_array) or (None,..)."""
+    try:
+        import gemmi
+        import numpy as np
+    except ImportError:
+        return None, None, None
+    try:
+        mtz = gemmi.read_mtz_file(mtz_path)
+    except (RuntimeError, IOError, OSError, ValueError):
+        return None, None, None
+    icol = next((c for c in mtz.columns if c.type == "J"), None)
+    if icol is None:
+        return None, None, None
+    try:
+        hkl = mtz.make_miller_array()
+        inv_d2 = mtz.make_1_d2_array()
+        ivals = np.asarray(icol.array, dtype=float)
+    except (RuntimeError, ValueError):
+        return None, None, None
+    good = np.isfinite(ivals)
+    data = {}
+    for (h, k, l), inten in zip(hkl[good], ivals[good]):
+        data[(int(h), int(k), int(l))] = float(inten)
+    return data, inv_d2[good], ivals[good]
+
+
+def wilson_b_from_arrays(inv_d2, ivals, d_cut=4.0, nbins=20):
+    """Relative Wilson B from a straight-line fit of ln<I> vs (sin th/lambda)^2.
+
+    Uses reflections with d < d_cut (the ~linear high-resolution part of the
+    Wilson plot). The atomic-scattering term is omitted, so the absolute value
+    carries an offset that is identical across chunks (same composition and
+    binning) and therefore cancels in dB. Returns B (A^2) or None."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if inv_d2 is None or len(inv_d2) < 200:
+        return None
+    sel = inv_d2 >= (1.0 / (d_cut * d_cut))
+    if sel.sum() < 200:
+        sel = np.ones(len(inv_d2), dtype=bool)
+    x = inv_d2[sel] / 4.0                    # (sin theta / lambda)^2
+    y = ivals[sel]
+    edges = np.linspace(x.min(), x.max(), nbins + 1)
+    idx = np.clip(np.digitize(x, edges) - 1, 0, nbins - 1)
+    xs, ys = [], []
+    for b in range(nbins):
+        m = idx == b
+        if m.sum() < 5:
+            continue
+        mi = y[m].mean()
+        if mi <= 0:
+            continue
+        xs.append(0.5 * (edges[b] + edges[b + 1]))
+        ys.append(math.log(mi))
+    if len(xs) < 5:
+        return None
+    slope, _ = np.polyfit(np.array(xs), np.array(ys), 1)
+    b = -slope / 2.0
+    return b if math.isfinite(b) else None
+
+
+def gemmi_available():
+    try:
+        import gemmi  # noqa: F401
+        import numpy   # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def wilson_b_by_chunk(rows_meta, diagnostics, route):
+    """Estimate Wilson B from each chunk's merged MTZ (only where not scraped).
+
+    rows_meta: list of dicts with keys chunk, mtz, wilson_scraped.
+    Returns {chunk: B}."""
+    result = {}
+    if not gemmi_available():
+        diagnostics.append("    [%s] gemmi unavailable in this Python — Wilson B "
+                           "(MTZ fallback) skipped; run with the trfrx venv to "
+                           "enable it" % route)
+        return result
+    for meta in rows_meta:
+        mtz = meta["mtz"]
+        if not mtz or meta["wilson_scraped"] is not None:
+            continue
+        _data, inv_d2, ivals = _read_mtz_intensities(mtz)
+        if inv_d2 is None:
+            diagnostics.append("    [%s] could not read MTZ %s" % (route, mtz))
+            continue
+        b = wilson_b_from_arrays(inv_d2, ivals)
+        if b is not None:
+            result[meta["chunk"]] = b
+            diagnostics.append("    [%s] Wilson B = %.2f <- %s (from merged I)"
+                               % (route, b, os.path.basename(mtz)))
+    return result
+
+
+# --------------------------------------------------------------------------
+# PDF report.
+# --------------------------------------------------------------------------
+def _series(rows, col):
+    """(x, y) of mean image number vs numeric metric, dropping N/A."""
+    xs, ys = [], []
+    for r in rows:
+        d = dict(r)
+        y = to_float(d.get(col))
+        first = to_float(d.get("image_first"))
+        last = to_float(d.get("image_last"))
+        if y is None or first is None or last is None:
+            continue
+        xs.append(0.5 * (first + last))
+        ys.append(y)
+    return xs, ys
+
+
+def _pct_change_series(rows, col):
+    xs, ys = _series(rows, col)
+    if not ys or ys[0] == 0:
+        return [], []
+    base = ys[0]
+    return xs, [100.0 * (y - base) / base for y in ys]
+
+
+def _damage_plots(pdf, plt, rows, dataset, title):
+    """Radiation-damage plots (metrics vs image number)."""
+    fig = plt.figure(figsize=(8.27, 11.69))
+    fig.suptitle("%s  —  %s\nradiation-damage indicators vs image number"
+                 % (dataset, title), fontsize=13, y=0.98)
+    xlabel = "Image number"
+
+    def ax_at(idx):
+        ax = fig.add_subplot(4, 2, idx)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=7)
+        ax.set_xlabel(xlabel, fontsize=7)
+        return ax
+
+    # 1) High-resolution limit vs dose. Y-axis inverted so that better
+    #    resolution (smaller d) is at the top: the curve then falls as damage
+    #    pushes the limit to higher d.
+    ax = ax_at(1)
+    xs, ys = _series(rows, "resolution_high")
+    if xs:
+        ax.plot(xs, ys, "o-", ms=3, color="C0")
+        ax.invert_yaxis()
+    ax.set_title("High-resolution limit (better = up)", fontsize=8)
+    ax.set_ylabel("d_high (A)", fontsize=7)
+
+    # 2) R-factors vs dose (rising = damage).
+    ax = ax_at(2)
+    for col, lab in [("Rmerge", "Rmerge"), ("Rmeas", "Rmeas"), ("Rpim", "Rpim")]:
+        xs, ys = _series(rows, col)
+        if xs:
+            ax.plot(xs, ys, "o-", ms=3, label=lab)
+    ax.set_title("R-factors (overall)", fontsize=8)
+    ax.set_ylabel("R", fontsize=7)
+    ax.legend(fontsize=6)
+
+    # 3) Mean I/sigma(I) vs dose (falling = damage).
+    ax = ax_at(3)
+    for col, lab in [("Mean_I_over_sigma", "overall"),
+                     ("Mean_I_over_sigma_outer", "outer shell")]:
+        xs, ys = _series(rows, col)
+        if xs:
+            ax.plot(xs, ys, "o-", ms=3, label=lab)
+    ax.set_title("Mean I / sigma(I)", fontsize=8)
+    ax.set_ylabel("I/sigma(I)", fontsize=7)
+    ax.legend(fontsize=6)
+
+    # 4) CC(1/2) vs dose (falling = damage).
+    ax = ax_at(4)
+    for col, lab in [("CC_half", "overall"), ("CC_half_outer", "outer shell")]:
+        xs, ys = _series(rows, col)
+        if xs:
+            ax.plot(xs, ys, "o-", ms=3, label=lab)
+    ax.set_title("CC(1/2)", fontsize=8)
+    ax.set_ylabel("CC(1/2)", fontsize=7)
+    ax.legend(fontsize=6)
+
+    # 5) Wilson B (global decay / B-scaling curve).
+    ax = ax_at(5)
+    xs, ys = _series(rows, "Wilson_B")
+    if xs:
+        ax.plot(xs, ys, "o-", ms=3, color="C3")
+    else:
+        ax.text(0.5, 0.5, "Wilson B unavailable", ha="center", va="center",
+                fontsize=7, transform=ax.transAxes)
+    ax.set_title("Wilson B-factor", fontsize=8)
+    ax.set_ylabel("Wilson B (A^2)", fontsize=7)
+
+    # 6) Unit-cell edges, % change vs dose. Always draw all three edges; distinct
+    #    line styles/markers (and some transparency) keep 'a' visible even when a
+    #    symmetry constraint makes it coincide with another edge.
+    ax = ax_at(6)
+    for k, style in [("a", "o-"), ("b", "s--"), ("c", "^:")]:
+        xk, yk = _pct_change_series(rows, "cell_" + k)
+        if xk:
+            ax.plot(xk, yk, style, ms=3, alpha=0.8, label=k)
+    ax.set_title("Unit-cell edges (% change)", fontsize=8)
+    ax.set_ylabel("delta edge (%)", fontsize=7)
+    ax.legend(fontsize=6)
+
+    # 7) Unit-cell volume, % change vs dose.
+    ax = ax_at(7)
+    xs, ys = _pct_change_series(rows, "cell_volume")
+    if xs:
+        ax.plot(xs, ys, "o-", ms=3, color="C2")
+    ax.set_title("Unit-cell volume (% change)", fontsize=8)
+    ax.set_ylabel("delta V (%)", fontsize=7)
+
+    # 8) Images actually used per chunk vs dose.
+    ax = ax_at(8)
+    xs, ys = _series(rows, "images_used")
+    xr, yr = _series(rows, "n_images")
+    if xr:
+        ax.plot(xr, yr, "o--", ms=3, color="0.6", label="requested")
+    if xs:
+        ax.plot(xs, ys, "o-", ms=3, color="C1", label="used")
+    ax.set_title("Images per chunk", fontsize=8)
+    ax.set_ylabel("N images", fontsize=7)
+    ax.legend(fontsize=6)
+
+    fig.subplots_adjust(left=0.09, right=0.9, top=0.90, bottom=0.06,
+                        hspace=0.5, wspace=0.45)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+# Display rows for the statistics table: (label, kind, *cols). kind is
+# 'range' (low-high), 'ovouter' (overall (outer)), 'cell' (a b c) or 'plain'.
+TABLE_SPEC = [
+    ("Resolution (A)",          "range",   "resolution_low", "resolution_high"),
+    ("Rmerge",                  "ovouter", "Rmerge"),
+    ("Rmeas",                   "ovouter", "Rmeas"),
+    ("Rpim",                    "ovouter", "Rpim"),
+    ("I / sigma(I)",            "ovouter", "Mean_I_over_sigma"),
+    ("CC(1/2)",                 "ovouter", "CC_half"),
+    ("Completeness (%)",        "ovouter", "Completeness"),
+    ("Completeness ellip. (%)", "ovouter", "Completeness_ellipsoidal"),
+    ("Multiplicity",            "ovouter", "Multiplicity"),
+    ("Wilson B (A^2)",          "plain",   "Wilson_B"),
+    ("Unit cell a b c (A)",     "cell",    "cell_a", "cell_b", "cell_c"),
+    ("Cell volume (A^3)",       "plain",   "cell_volume"),
+    ("N observations",          "plain",   "N_observations"),
+    ("N unique",                "plain",   "N_unique"),
+    ("Images requested",        "plain",   "n_images"),
+    ("Images used",             "plain",   "images_used"),
+]
+
+
+def _cell_text(spec, d):
+    label, kind = spec[0], spec[1]
+    if kind == "range":
+        lo, hi = d.get(spec[2], "N/A"), d.get(spec[3], "N/A")
+        return "%s - %s" % (lo, hi)
+    if kind == "ovouter":
+        ov = d.get(spec[2], "N/A")
+        out = d.get(spec[2] + "_outer", "N/A")
+        return "%s (%s)" % (ov, out)
+    if kind == "cell":
+        # Stack the three edges on their own lines so full precision still fits
+        # inside one narrow column (the row is given extra height below).
+        return "\n".join(str(d.get(c, "N/A")) for c in spec[2:])
+    return str(d.get(spec[2], "N/A"))
+
+
+def _stats_tables(pdf, plt, rows, dataset, title):
+    # Balance chunks across pages so the last page is never a lone column
+    # (e.g. 16 chunks -> 4+4+4+4, not 5+5+5+1).
+    max_per_page = 5
+    n = len(rows)
+    n_pages = max(1, math.ceil(n / max_per_page))
+    per_page = math.ceil(n / n_pages)
+    first_w = 0.30
+    # Fixed per-column width (based on a full page) so short pages keep the same
+    # column size and are left-justified rather than stretched across the sheet.
+    fixed_w = (1.0 - first_w) / max_per_page
+
+    for start in range(0, n, per_page):
+        page_rows = rows[start:start + per_page]
+        dicts = [dict(r) for r in page_rows]
+        col_labels = ["Statistic"] + [d["chunk"].replace("autoPROC_", "")
+                                      for d in dicts]
+        table_data = [[spec[0]] + [_cell_text(spec, d) for d in dicts]
+                      for spec in TABLE_SPEC]
+
+        fig = plt.figure(figsize=(8.27, 11.69))
+        fig.suptitle("%s  —  %s\nstatistics per chunk (overall, outer shell in "
+                     "parentheses)   [%d-%d]"
+                     % (dataset, title, start + 1, start + len(page_rows)),
+                     fontsize=11)
+        ax = fig.add_axes([0.02, 0.03, 0.96, 0.9])
+        ax.axis("off")
+        col_widths = [first_w] + [fixed_w] * len(page_rows)
+        tbl = ax.table(cellText=table_data, colLabels=col_labels,
+                       colWidths=col_widths, loc="center", cellLoc="center")
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(7)
+        tbl.scale(1, 1.5)
+        # The multi-line unit-cell row (a/b/c stacked) needs extra height.
+        cell_row = next((i for i, s in enumerate(TABLE_SPEC)
+                         if s[1] == "cell"), None)
+        cell_row = cell_row + 1 if cell_row is not None else None   # +1 for header
+        # Left-align the statistic-name column, bold the header, grow the
+        # stacked unit-cell row.
+        for (r, c), cell in tbl.get_celld().items():
+            if c == 0 and r > 0:
+                cell.set_text_props(ha="left")
+                cell.PAD = 0.03
+            if r == 0:
+                cell.set_text_props(weight="bold")
+            if r == cell_row:
+                cell.set_height(cell.get_height() * 2.8)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+
+def write_pdf(path, dataset, title, rows, image_summary):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -431,16 +890,18 @@ def write_pdf(path, title, rows, image_summary):
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     with PdfPages(path) as pdf:
         # ---- Cover / image-usage page ----
-        fig = plt.figure(figsize=(8.27, 11.69))  # A4 portrait
-        fig.suptitle(title, fontsize=16, y=0.97)
-        ax = fig.add_axes([0.06, 0.06, 0.88, 0.84])
+        fig = plt.figure(figsize=(8.27, 11.69))
+        fig.text(0.5, 0.93, dataset, ha="center", fontsize=22, weight="bold")
+        fig.text(0.5, 0.895, "%s route — radiation-damage report" % title,
+                 ha="center", fontsize=13)
+        ax = fig.add_axes([0.08, 0.06, 0.86, 0.80])
         ax.axis("off")
         lines = [
             "Generated: %s" % stamp,
-            "Chunks merged: %d" % len(image_summary),
-            "Total images used: %d" % sum(n for _, _, n in image_summary),
+            "Chunks (image ranges): %d" % len(image_summary),
+            "Total images requested: %d" % sum(n for _, _, n in image_summary),
             "",
-            "Image ranges used:",
+            "Image ranges:",
         ]
         for name, rng, n in image_summary:
             lines.append("    %-24s images %-14s (%d)" % (name, rng, n))
@@ -449,46 +910,39 @@ def write_pdf(path, title, rows, image_summary):
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---- Statistics tables (chunks as columns, metrics as rows) ----
         if rows:
-            metric_cols = [c for c, _ in rows[0]
-                           if c not in ("chunk", "image_first", "image_last", "source_file")]
-            chunks_per_page = 6
-            for start in range(0, len(rows), chunks_per_page):
-                page_rows = rows[start:start + chunks_per_page]
-                col_labels = [""] + [dict(r)["chunk"].replace("autoPROC_", "")
-                                     for r in page_rows]
-                table_data = []
-                for metric in metric_cols:
-                    line = [metric] + [str(dict(r).get(metric, "N/A")) for r in page_rows]
-                    table_data.append(line)
-                fig = plt.figure(figsize=(8.27, 11.69))
-                fig.suptitle("%s - statistics (%d-%d)"
-                             % (title, start + 1, start + len(page_rows)), fontsize=12)
-                ax = fig.add_axes([0.03, 0.03, 0.94, 0.9])
-                ax.axis("off")
-                tbl = ax.table(cellText=table_data, colLabels=col_labels,
-                               loc="center", cellLoc="center")
-                tbl.auto_set_font_size(False)
-                tbl.set_fontsize(7)
-                tbl.scale(1, 1.4)
-                pdf.savefig(fig)
-                plt.close(fig)
+            _damage_plots(pdf, plt, rows, dataset, title)
+            _stats_tables(pdf, plt, rows, dataset, title)
     return True
 
 
+def detect_dataset(process_dir, override):
+    if override:
+        return override
+    p = process_dir.rstrip(os.sep)
+    base = os.path.basename(p)
+    if base == "autoproc_chunks":
+        parent = os.path.basename(os.path.dirname(p))
+        return parent or base
+    return base
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--process-dir", required=True,
                         help="Path to the autoproc_chunks directory.")
     parser.add_argument("--out", default=None,
                         help="Output directory (default: <process-dir>/reports).")
+    parser.add_argument("--dataset", default=None,
+                        help="Dataset name shown at the top of the reports "
+                             "(default: parent folder of autoproc_chunks).")
     args = parser.parse_args()
 
     process_dir = os.path.abspath(args.process_dir)
     out_dir = args.out or os.path.join(process_dir, "reports")
     os.makedirs(out_dir, exist_ok=True)
+    dataset = detect_dataset(process_dir, args.dataset)
 
     chunks = []
     for name in sorted(os.listdir(process_dir)):
@@ -498,26 +952,58 @@ def main():
             chunks.append((name, int(m.group(1)), int(m.group(2))))
     chunks.sort(key=lambda c: c[1])
 
-    diagnostics = ["autoPROC report generation - %s"
+    diagnostics = ["TR-FRX damage report - %s"
                    % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                   "Dataset: %s" % dataset,
                    "Process dir: %s" % process_dir,
                    "Chunks found: %d" % len(chunks),
-                   "Summary-data blocks located:"]
+                   "Per-chunk sources:"]
 
-    truncate_rows, staraniso_rows = [], []
+    best_by_chunk = {}
     image_summary = []
+    meta = {"truncate": [], "staraniso": []}
     for name, first, last in chunks:
         image_summary.append((name, "%d-%d" % (first, last), last - first + 1))
         best = collect_chunk_blocks(os.path.join(process_dir, name), diagnostics)
-        truncate_rows.append(build_row(name, first, last, best["truncate"]))
-        staraniso_rows.append(build_row(name, first, last, best["staraniso"]))
+        best_by_chunk[name] = (first, last, best)
+        mid = 0.5 * (first + last)
+        for route in ("truncate", "staraniso"):
+            b = best[route] if best[route] else {}
+            meta[route].append({"chunk": name, "mid": mid,
+                                "mtz": b.get("mtz"),
+                                "wilson_scraped": b.get("wilson_b")})
 
-    write_csv(os.path.join(out_dir, "truncate_statistics.csv"), truncate_rows)
-    write_csv(os.path.join(out_dir, "staraniso_statistics.csv"), staraniso_rows)
-    write_pdf(os.path.join(out_dir, "truncate_report.pdf"),
-              "Classical autoPROC (TRUNCATE)", truncate_rows, image_summary)
-    write_pdf(os.path.join(out_dir, "staraniso_report.pdf"),
-              "STARANISO", staraniso_rows, image_summary)
+    diagnostics.append("MTZ-derived Wilson B (fallback when not scraped):")
+    wilson_mtz = {}
+    for route in ("truncate", "staraniso"):
+        wilson_mtz[route] = wilson_b_by_chunk(meta[route], diagnostics, route)
+
+    def route_wilson(route, name):
+        b = best_by_chunk[name][2][route]
+        scraped = b.get("wilson_b") if b else None
+        return scraped if scraped is not None else wilson_mtz[route].get(name)
+
+    def rows_for(route):
+        other = "staraniso" if route == "truncate" else "truncate"
+        rows = []
+        for name, first, last in chunks:
+            b = best_by_chunk[name][2][route]
+            # Wilson B is a property of the crystal, not the route: if this route
+            # has none (e.g. STARANISO logs omit it and gemmi is unavailable for
+            # the MTZ fallback), reuse the other route's value.
+            wilson = route_wilson(route, name)
+            if wilson is None:
+                wilson = route_wilson(other, name)
+            images = b.get("images_used") if b else None
+            rows.append(build_row(name, first, last, b, wilson, images))
+        return rows
+
+    for route, pretty in [("truncate", "Classical autoPROC (TRUNCATE)"),
+                          ("staraniso", "STARANISO")]:
+        rows = rows_for(route)
+        write_csv(os.path.join(out_dir, "%s_statistics.csv" % route), rows)
+        write_pdf(os.path.join(out_dir, "%s_report.pdf" % route),
+                  dataset, pretty, rows, image_summary)
 
     with open(os.path.join(out_dir, "parsing_diagnostics.txt"), "w") as fh:
         fh.write("\n".join(diagnostics) + "\n")
@@ -535,8 +1021,17 @@ cat > "$REPORT_JOB_SCRIPT" <<EOF
 set -euo pipefail
 module load autoPROC
 cd "$PROCESS_DIR"
-if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
-"\$PY" "$PROCESS_DIR/autoproc_reports.py" --process-dir "$PROCESS_DIR"
+# Prefer the trfrx venv (created by setup_env.sh): it carries matplotlib and
+# gemmi, needed for the PDF plots and the MTZ-derived Wilson B. Fall back to any
+# python3/python on PATH (the CSVs and scraped stats still work without them).
+if [ -x "\$HOME/.venv/trfrx/bin/python" ]; then
+    PY="\$HOME/.venv/trfrx/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    PY=python
+fi
+"\$PY" "$PROCESS_DIR/trfrx_damage_report.py" --process-dir "$PROCESS_DIR"
 EOF
 
 # NB : afterany (et non afterok) => le rapport est TOUJOURS généré une fois que
