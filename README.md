@@ -200,13 +200,14 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 ## Quick reference
 
 ```bash
-# ── Terminal 1 · plain shell ─────────────────────────────
+# ── One shell, environment activated ─────────────────────
+source scripts/setup_env.sh
+
 # 0. edit variables, then submit autoPROC from the image folder
 cd /data/images/PfuGRHPR_006
 bash /path/to/scripts/TR-FRX_autoPROC.sh          # → wait for SLURM
 
-# ── Terminal 2 · pipeline environment ────────────────────
-source scripts/setup_env.sh
+# 1+. after all SLURM jobs finish, run the full pipeline
 python scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
 #     → /data/processed/PfuGRHPR_006/run_01/report.html
 ```
