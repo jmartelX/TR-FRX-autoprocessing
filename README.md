@@ -73,11 +73,7 @@ source scripts/setup_env.sh
 ```
 
 > [!IMPORTANT]
-> **Use two terminals.** `setup_env.sh` is only needed for the pipeline
-> (Step 1+). Run the autoPROC step (Step 0) in its **own, plain** terminal, and
-> the pipeline in a **separate** terminal where you have sourced `setup_env.sh`
-> — the pipeline environment (PHENIX/CCP4/PyMOL modules + virtualenv) can
-> otherwise interfere with autoPROC's own module setup.
+> **Use all scripts in this env.** `setup_env.sh` is needed for the autoPROC step (Step 0), and the pipeline (Step 1+).
 
 Make the scripts executable once after cloning:
 
