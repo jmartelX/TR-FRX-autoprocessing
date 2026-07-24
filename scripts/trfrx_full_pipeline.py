@@ -2589,6 +2589,20 @@ summary { cursor: pointer; font-weight: 600; padding: .3rem 0; }
 """
 
 
+def _report_dir_key(md: Path):
+    """Sort key that orders per-map report folders by their timepoint index.
+
+    Folder names look like ``dFo_<name>_<label>_1`` (label = 1_300, 301_600, …).
+    Strip the ``dFo_`` prefix and the phenix ``_1`` job suffix, then reuse
+    mtz_sort_index so the report lists timepoints in acquisition order rather
+    than lexicographically.
+    """
+    stem = re.sub(r"^dFo_", "", md.name)
+    stem = re.sub(r"_\d+$", "", stem)          # drop the phenix _1 job suffix
+    idx = mtz_sort_index(Path(stem + ".mtz"))
+    return (idx if idx is not None else 10 ** 12, md.name)
+
+
 def build_html_report(dfo: Path, out_html: Path, name: str, meta: dict) -> Path:
     """One self-contained HTML page: timepoint summary, SVD, persistence, and a
     collapsible per-map section with the peak tables and images embedded inline.
@@ -2631,7 +2645,8 @@ def build_html_report(dfo: Path, out_html: Path, name: str, meta: dict) -> Path:
 
     if reports.is_dir():
         map_blocks = []
-        for md in sorted(d for d in reports.iterdir() if d.is_dir()):
+        for md in sorted((d for d in reports.iterdir() if d.is_dir()),
+                         key=_report_dir_key):
             ph, pr = _read_csv_rows(md / "peaks.csv")
             figs, n_imgs = "", 0
             for sub in ("img", "img2d"):     # 3D cages and/or 2D sections
