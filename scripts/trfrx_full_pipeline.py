@@ -2092,6 +2092,20 @@ def copy_chunks(source: Path, dest_root: Path, files_to_copy: list,
     print(f"  Chunks: {len(results)}   files copied: {copied}   missing: {missing}{extra}")
     for f in failures:
         print(f"  FAILED {f}")
+
+    # Also bring over the autoPROC damage reports (autoproc_chunks/reports/,
+    # produced by TR-FRX_autoPROC.sh) so they live alongside the copied chunks.
+    src_reports = source / "reports"
+    dst_reports = dest_root / "reports"
+    if src_reports.is_dir():
+        if dry_run:
+            print(f"  [dry-run] would copy reports/ -> {dst_reports}")
+        elif resume and dst_reports.is_dir():
+            print("  reports/ already present (skipped)")
+        else:
+            shutil.copytree(src_reports, dst_reports, dirs_exist_ok=True)
+            n = sum(1 for p in dst_reports.rglob("*") if p.is_file())
+            print(f"  reports/: copied {n} file(s) -> {dst_reports}")
     return dest_root
 
 
