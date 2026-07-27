@@ -374,6 +374,23 @@ def scrape_wilson_b(text):
     return best
 
 
+def scrape_staraniso_wilson_b(text):
+    """STARANISO Popov-Bourenkov Wilson B from staraniso_alldata.log.
+
+    STARANISO prints a 'Wilson plots using as expected intensity' section whose
+    columns are 'intercept, gradient, WilsonB, Goodness-of-Fit'; the 'PB' row
+    (Popov & Bourenkov 2003 expected intensities) gives WilsonB (3rd column).
+    The last such block in the file is the converged one.
+    """
+    heads = list(re.finditer(r"intercept\s*,\s*gradient\s*,\s*WilsonB", text, re.I))
+    if not heads:
+        return None
+    tail = text[heads[-1].end():]
+    m = re.search(r"^\s*PB\s+(%s)\s+(%s)\s+(%s)\s+(%s)" % (NUM, NUM, NUM, NUM),
+                  tail, re.M)
+    return to_float(m.group(3)) if m else None
+
+
 def scrape_cell(text):
     """Return (a, b, c, al, be, ga) preferring an 'Average unit cell' line."""
     m = CELL_AVG_RE.search(text) or CELL_ANY_RE.search(text)
@@ -418,6 +435,7 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
     best = {"truncate": None, "staraniso": None}
     best_rank = {"truncate": (-1, -1), "staraniso": (-1, -1)}
     extra = {r: {"cell": None, "mtz": None, "wilson_b": None, "images_used": None,
+                 "wb_source": None,
                  "cell_rank": -1, "mtz_rank": -1, "wb_rank": -1, "img_rank": -1}
              for r in ("truncate", "staraniso")}
 
@@ -442,8 +460,10 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
                                or "_early" in fname.lower()) else prio
         if wilson is not None and wb_prio > e["wb_rank"]:
             e["wilson_b"], e["wb_rank"] = wilson, wb_prio
-            diagnostics.append("    [%s] Wilson B = %s <- %s (scraped)"
-                               % (route, wilson, rel))
+            method = "Popov-Bourenkov" if route == "staraniso" else "CTRUNCATE"
+            e["wb_source"] = "%s (%s)" % (os.path.basename(fname), method)
+            diagnostics.append("    [%s] Wilson B = %s <- %s (%s)"
+                               % (route, wilson, rel, method))
         if images is not None:
             n, tag = images
             # Prefer AIMLESS batch count; keep the first plausible hit.
@@ -479,7 +499,8 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
                 continue
             route_of_file = "staraniso" if "staraniso" in low else "truncate"
             cell = scrape_cell(text)
-            wilson = scrape_wilson_b(text)
+            wilson = (scrape_staraniso_wilson_b(text) if route_of_file == "staraniso"
+                      else scrape_wilson_b(text))
             images = scrape_images_used(text)
             images = images if images[0] is not None else None
             # Unit cell / images used are route-agnostic — record for both so the
@@ -500,7 +521,8 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
         data = best[route] or {"metrics": {}, "source": "N/A"}
         e = extra[route]
         data.update({"cell": e["cell"], "mtz": e["mtz"],
-                     "wilson_b": e["wilson_b"], "images_used": e["images_used"]})
+                     "wilson_b": e["wilson_b"], "wb_source": e["wb_source"],
+                     "images_used": e["images_used"]})
         has_any = (best[route] or e["cell"] or e["mtz"]
                    or e["wilson_b"] is not None or e["images_used"] is not None)
         result[route] = data if has_any else None
@@ -515,7 +537,8 @@ def match_metric(metrics, must, mustnot):
     return None
 
 
-def build_row(chunk_name, first, last, block, wilson_b, images_used):
+def build_row(chunk_name, first, last, block, wilson_b, images_used,
+              wilson_source="N/A"):
     """Return an ordered list of (column, value) for one chunk."""
     row = [
         ("chunk", chunk_name),
@@ -533,6 +556,7 @@ def build_row(chunk_name, first, last, block, wilson_b, images_used):
     cell = block.get("cell") if block else None
     vol = cell_volume(cell) if cell else None
     row.append(("Wilson_B", "%.2f" % wilson_b if wilson_b is not None else "N/A"))
+    row.append(("Wilson_B_source", wilson_source))
     names = ["cell_a", "cell_b", "cell_c", "cell_al", "cell_be", "cell_ga"]
     for idx, nm in enumerate(names):
         row.append((nm, "%.3f" % cell[idx] if cell else "N/A"))
@@ -683,7 +707,7 @@ def _pct_change_series(rows, col):
     return xs, [100.0 * (y - base) / base for y in ys]
 
 
-def _damage_plots(pdf, plt, rows, dataset, title):
+def _damage_plots(pdf, plt, rows, dataset, title, wilson_method=""):
     """Radiation-damage plots (metrics vs image number)."""
     fig = plt.figure(figsize=(8.27, 11.69))
     fig.suptitle("%s  —  %s\nradiation-damage indicators vs image number"
@@ -747,7 +771,8 @@ def _damage_plots(pdf, plt, rows, dataset, title):
     else:
         ax.text(0.5, 0.5, "Wilson B unavailable", ha="center", va="center",
                 fontsize=7, transform=ax.transAxes)
-    ax.set_title("Wilson B-factor", fontsize=8)
+    ax.set_title(("Wilson B-factor\n(%s)" % wilson_method) if wilson_method
+                 else "Wilson B-factor", fontsize=6.5)
     ax.set_ylabel("Wilson B (A^2)", fontsize=7)
 
     # 6) Unit-cell edges, % change vs dose. Always draw all three edges; distinct
@@ -877,7 +902,7 @@ def _stats_tables(pdf, plt, rows, dataset, title):
         plt.close(fig)
 
 
-def write_pdf(path, dataset, title, rows, image_summary):
+def write_pdf(path, dataset, title, rows, image_summary, wilson_method=""):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -911,7 +936,7 @@ def write_pdf(path, dataset, title, rows, image_summary):
         plt.close(fig)
 
         if rows:
-            _damage_plots(pdf, plt, rows, dataset, title)
+            _damage_plots(pdf, plt, rows, dataset, title, wilson_method)
             _stats_tables(pdf, plt, rows, dataset, title)
     return True
 
@@ -981,29 +1006,36 @@ def main():
     def route_wilson(route, name):
         b = best_by_chunk[name][2][route]
         scraped = b.get("wilson_b") if b else None
-        return scraped if scraped is not None else wilson_mtz[route].get(name)
+        if scraped is not None:
+            return scraped, (b.get("wb_source") or ("%s log" % route))
+        mtzb = wilson_mtz[route].get(name)
+        if mtzb is not None:
+            return mtzb, "MTZ fit (FALLBACK - different method!)"
+        return None, "N/A"
 
     def rows_for(route):
-        other = "staraniso" if route == "truncate" else "truncate"
         rows = []
         for name, first, last in chunks:
             b = best_by_chunk[name][2][route]
-            # Wilson B is a property of the crystal, not the route: if this route
-            # has none (e.g. STARANISO logs omit it and gemmi is unavailable for
-            # the MTZ fallback), reuse the other route's value.
-            wilson = route_wilson(route, name)
-            if wilson is None:
-                wilson = route_wilson(other, name)
+            # Each route uses ONLY its own Wilson B (truncate -> CTRUNCATE,
+            # staraniso -> STARANISO Popov-Bourenkov). No cross-route borrowing:
+            # the two are computed with different normalisations, so mixing them
+            # would be meaningless. MTZ fit is a clearly-flagged last resort only.
+            wilson, wsource = route_wilson(route, name)
             images = b.get("images_used") if b else None
-            rows.append(build_row(name, first, last, b, wilson, images))
+            rows.append(build_row(name, first, last, b, wilson, images, wsource))
         return rows
 
+    wmethods = {
+        "truncate":  "CTRUNCATE Wilson plot (average-atom, composition from cell)",
+        "staraniso": "STARANISO Wilson B (Popov & Bourenkov 2003 normalisation)",
+    }
     for route, pretty in [("truncate", "Classical autoPROC (TRUNCATE)"),
                           ("staraniso", "STARANISO")]:
         rows = rows_for(route)
         write_csv(os.path.join(out_dir, "%s_statistics.csv" % route), rows)
         write_pdf(os.path.join(out_dir, "%s_report.pdf" % route),
-                  dataset, pretty, rows, image_summary)
+                  dataset, pretty, rows, image_summary, wmethods[route])
 
     with open(os.path.join(out_dir, "parsing_diagnostics.txt"), "w") as fh:
         fh.write("\n".join(diagnostics) + "\n")
