@@ -66,6 +66,27 @@ N_PEAKS_DEFAULT = 20     # peaks IMAGED per map (the table keeps all above the c
 MAX_TABLE_PEAKS = 200    # hard safety cap on tabulated peaks per map
 LOW_RES_DEFAULT = 10.0   # low-resolution cutoff for the difference maps
 
+# ── Resolution handling (honest per-map limit + unbiased-SVD common cutoff) ──
+# Feature 1: each difference map is computed at its OWN honest resolution — the
+# limit beyond which SPHERICAL completeness drops below COMPLETENESS_MIN. This is
+# the resolution that actually governs an isotropic FFT map, unlike the header's
+# resolution_high() (the anisotropic ellipsoid tip for staraniso files).
+COMPLETENESS_MIN = 0.90   # a shell counts as "present" above this completeness
+EFF_RES_BINS     = 20     # resolution shells used for the completeness scan
+
+# Feature 2: the JOINT SVD needs one common cutoff (all maps truncated to it on
+# read). A lone very-low-res timepoint would drag that cutoff down and blur every
+# component, so such resolution OUTLIERS are dropped from the SVD (their individual
+# maps are still made and still appear in the recap). Gap rule: cut before a jump
+# in the sorted honest resolutions that is BOTH >= SVD_OUTLIER_ABS_GAP A AND
+# >= SVD_OUTLIER_REL_GAP x the median inter-dataset step. A gradual RADDAM decay
+# (many small steps, no jump) trips nothing, so every timepoint stays in.
+SVD_OUTLIER_ABS_GAP  = 0.5   # A  — minimum absolute jump to call something an outlier
+SVD_OUTLIER_REL_GAP  = 4.0   # x typical step — jump must also be this many times typical
+SVD_OUTLIER_MAX_FRAC = 0.4   # never call a MAJORITY outliers: if a gap would drop more
+                             # than this fraction it is a real resolution spread, not a
+                             # lone bad timepoint — keep everything at the worst cutoff.
+
 # Merge radius is deliberately MUCH smaller than the residue radius: its only
 # job is to collapse the several grid points of a single peak into one row.
 # Auto = max(MERGE_RADIUS_MIN, grid_spacing). Override with --merge-radius.
@@ -224,6 +245,83 @@ def detect_resolution_limit(mtz: Path) -> float:
     )
 
 
+def effective_resolution(mtz_path: Path,
+                         completeness_min: float = COMPLETENESS_MIN,
+                         n_bins: int = EFF_RES_BINS) -> float:
+    """Honest high-resolution limit: the resolution beyond which the data's
+    SPHERICAL completeness falls below *completeness_min*.
+
+    Why not resolution_high()?  resolution_high() is the single highest reflection
+    recorded.  For isotropically-truncated ("truncate") data that is ~honest.  For
+    anisotropically-truncated (staraniso) data it is the TIP of the resolution
+    ellipsoid (best direction) and badly over-optimistic — a file can read 1.9 A
+    while being < 50 % complete on a full sphere there.  An isotropic FFT difference
+    map (and the SVD built from it) is governed by the spherical-complete limit,
+    which is exactly what this returns, so staraniso and truncate files can be
+    compared on equal footing.
+
+    Method: bin the observed reflections into equal-reciprocal-volume shells (equal
+    steps in (1/d)^3, so each shell samples a comparable number of possible hkl).
+    Walk from low to high resolution; the honest limit is the high-res edge of the
+    deepest shell that is still complete, ignoring any low-res (beamstop) shells
+    that are incomplete before the data first becomes complete.
+
+    Never raises — resolution choice must not crash a run.  Falls back to the
+    nominal resolution_high() (then to detect_resolution_limit()) if gemmi, the
+    space group, or the reflection list are unavailable.
+    """
+    try:
+        import numpy as np
+        import gemmi
+        mtz = gemmi.read_mtz_file(str(mtz_path))
+        nominal = float(mtz.resolution_high())
+        sg = mtz.spacegroup
+        cell = mtz.cell
+        if sg is None:
+            return round(nominal, 4)
+        d = np.asarray(mtz.make_d_array(), dtype=float)
+        d = d[np.isfinite(d) & (d > 0)]
+        if d.size == 0:
+            return round(nominal, 4)
+        d_hi, d_lo = float(d.min()), float(d.max())
+        if not (d_hi < d_lo):
+            return round(nominal, 4)
+
+        # Equal-volume shells: equally spaced in reciprocal volume (1/d)^3.
+        edges_inv = np.linspace((1.0 / d_lo) ** 3, (1.0 / d_hi) ** 3, n_bins + 1)
+        edges_d   = (1.0 / edges_inv) ** (1.0 / 3.0)          # decreasing: low -> high res
+
+        def possible_to(dmin: float):
+            try:
+                return gemmi.count_reflections(cell, sg, float(dmin))
+            except Exception:
+                return None
+
+        eff     = nominal
+        reached = False   # skip incomplete low-res shells until data is first complete
+        for i in range(n_bins):
+            d_outer, d_inner = float(edges_d[i]), float(edges_d[i + 1])
+            p_out, p_in = possible_to(d_outer), possible_to(d_inner)
+            if p_out is None or p_in is None:
+                break
+            possible = p_in - p_out
+            if possible <= 0:
+                continue
+            observed = int(np.count_nonzero((d < d_outer) & (d >= d_inner)))
+            comp = observed / possible
+            if comp >= completeness_min:
+                reached, eff = True, d_inner                  # complete this deep -> push limit
+            elif reached:
+                eff = d_outer                                 # first drop after completeness -> stop
+                break
+        return round(float(eff), 4)
+    except Exception:
+        try:
+            return detect_resolution_limit(mtz_path)
+        except Exception:
+            return float("nan")
+
+
 def find_pdb(directory: Path) -> Path:
     pdbs = sorted(directory.glob("*.pdb"))
     if not pdbs:
@@ -310,8 +408,18 @@ def compute_diffmap(target, ref, model, labels, reslim, dry_run, out_dir, log_di
 #      (singular values) so the series recap can report SV weights.
 #      Existing outputs (maps, rSV.csv, plot) are unchanged.
 # ═════════════════════════════════════════════════════════════════════════
-def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None):
-    """Scan dfo_dir for dFo_*.mtz, run SVD, write maps/csv/plot. Returns [S]."""
+def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None,
+            common_dmin: float | None = None, exclude_stems: set | None = None):
+    """Scan dfo_dir for dFo_*.mtz, run SVD, write maps/csv/plot. Returns [S].
+
+    Unbiased-SVD controls (Feature 2):
+      * common_dmin   — every map is truncated (in reciprocal space, on read) to
+                        this one high-resolution limit before being stacked, so the
+                        decomposition compares maps of identical Fourier support.
+      * exclude_stems — source MTZ stems whose dFo map must NOT enter the SVD
+                        (resolution outliers). Their individual maps stay on disk;
+                        they are simply left out of the joint matrix.
+    """
     import numpy as np
     import pandas as pd
     import gemmi
@@ -347,21 +455,35 @@ def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None):
 
     _grid_size = None
 
+    def _truncate(mtz):
+        """Clean reciprocal-space truncation to common_dmin (drop finer reflections),
+        so every stacked map shares one resolution — no map is quietly sharper than
+        its neighbours, which would otherwise show up as a spurious SVD component."""
+        if common_dmin is None or not (common_dmin == common_dmin):   # None / NaN
+            return mtz
+        d = np.asarray(mtz.make_d_array(), dtype=float)
+        keep = d >= (common_dmin - 1e-6)
+        if not keep.all():
+            mtz.set_data(np.array(mtz.array)[keep])
+        return mtz
+
     def mtz_to_matrix(path):
         nonlocal _grid_size
-        mtz = gemmi.read_mtz_file(str(path))
+        mtz = _truncate(gemmi.read_mtz_file(str(path)))
         if _grid_size is None:
             grid = mtz.transform_f_phi_to_map("FoFo", "PHFc")
             arr  = np.array(grid, copy=False)
             _grid_size = list(arr.shape)
-            print(f"  SVD: grid size set to {_grid_size} from {path.name}")
+            print(f"  SVD: grid size set to {_grid_size} from {path.name}"
+                  + (f" (truncated to {common_dmin:.3f} A)" if common_dmin else ""))
             return arr
         grid = mtz.transform_f_phi_to_map("FoFo", "PHFc", exact_size=_grid_size)
         return np.array(grid, copy=False)
 
     def matrix_to_mtz(matrix, template, out):
-        mtz  = gemmi.read_mtz_file(str(template))
-        rlim = mtz.resolution_high()
+        mtz  = _truncate(gemmi.read_mtz_file(str(template)))
+        rlim = common_dmin if (common_dmin and common_dmin == common_dmin) \
+               else mtz.resolution_high()
         eg   = mtz.get_f_phi_on_grid("FoFo", "PHFc", _grid_size)
         rs   = gemmi.transform_f_phi_grid_to_map(eg)
         for z in range(rs.nw):
@@ -373,11 +495,20 @@ def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None):
         mtz.set_data(data)
         mtz.write_to_file(str(out))
 
+    excl = exclude_stems or set()
+
+    def _is_excluded(p) -> bool:
+        # exclude_stems holds SOURCE mtz stems; the dFo file is dFo_<src>_<idx>.mtz
+        return any(p.stem.startswith(f"dFo_{s}_") or p.stem == f"dFo_{s}" for s in excl)
+
     entries = []
     for p in sorted(dfo_dir.glob("dFo_*.mtz")):
         n = dataset_number(p.stem)
         if n is None:
             print(f"  SVD: skipping {p.name} (cannot parse dataset number)")
+            continue
+        if _is_excluded(p):
+            print(f"  SVD: EXCLUDING {p.name} (resolution outlier; its map is kept)")
             continue
         entries.append((n, p))
 
@@ -612,6 +743,198 @@ def prompt_resolution_choice(mtz_files: list[Path],
             kept = [m for m in mtz_files if m.name not in droppable]
             print(f"  Dropped {len(droppable)} file(s); {len(kept)} remain.")
     return reslim, kept
+
+
+def svd_common_resolution(res_by_name: dict,
+                          abs_gap: float = SVD_OUTLIER_ABS_GAP,
+                          rel_gap: float = SVD_OUTLIER_REL_GAP,
+                          max_frac: float = SVD_OUTLIER_MAX_FRAC) -> tuple[float, set, dict]:
+    """
+    Common high-resolution cutoff for the JOINT SVD + the timepoints to exclude
+    as resolution outliers.
+
+    Every map entering the SVD is truncated to ONE common dmin (= worst resolution
+    among the KEPT maps). A single very-low-res timepoint would drag that cutoff
+    down and blur every component, so it is dropped from the SVD (its individual map
+    is untouched).
+
+    Rule: sort the resolutions (best -> worst). Scanning from the worst side, take
+    the first gap between consecutive values that is BOTH >= abs_gap A AND >= rel_gap
+    x the PACK's typical step (the median step among the better-resolution datasets
+    only — so the outlier's own huge jump can't inflate the reference). Everything
+    worse than that gap is an outlier. Two guards keep it honest:
+      * a gradual RADDAM decay (many small steps, no jump) triggers nothing;
+      * if a gap would drop MORE than max_frac of the timepoints it is treated as a
+        genuine resolution spread (two regimes), not a lone bad point — everything
+        is kept at the worst cutoff and the spread is reported instead.
+
+    Returns (common_dmin, {excluded_names}, info).
+    """
+    import statistics
+    items = sorted(res_by_name.items(), key=lambda kv: kv[1])   # (name, res) best -> worst
+    res = [v for _, v in items]
+    if len(res) <= 2:
+        return (max(res) if res else float("nan")), set(), {"gap": None}
+    steps = [res[i + 1] - res[i] for i in range(len(res) - 1)]
+
+    cut_idx, typ = None, None
+    # candidate gap sits between res[i] and res[i+1]; need >=1 pack step (i >= 1)
+    for i in range(len(steps) - 1, 0, -1):
+        pack = steps[:i]                            # steps among the kept (better) pack only
+        typical = (statistics.median(pack) or 1e-6) if pack else 1e-6
+        if steps[i] >= abs_gap and steps[i] >= rel_gap * typical:
+            n_dropped = len(res) - (i + 1)
+            if n_dropped > max_frac * len(res):     # majority -> real spread, not an outlier
+                return max(res), set(), {
+                    "gap": round(steps[i], 3), "typical_step": round(typical, 3),
+                    "note": f"large resolution spread ({n_dropped}/{len(res)} beyond a "
+                            f"{steps[i]:.2f} A gap) — kept all at {max(res):.2f} A"}
+            cut_idx, typ = i + 1, typical
+            break
+    if cut_idx is None:
+        return max(res), set(), {"gap": None}
+    kept, dropped = items[:cut_idx], items[cut_idx:]
+    common = kept[-1][1]
+    info = {"gap": round(res[cut_idx] - res[cut_idx - 1], 3),
+            "typical_step": round(typ, 3), "cut_res": common,
+            "dropped": [(n, round(r, 3)) for n, r in dropped]}
+    return common, {n for n, _ in dropped}, info
+
+
+def plan_resolutions(mtz_files: list[Path], ref: Path,
+                     forced: float | None, interactive: bool) -> dict:
+    """
+    Decide, honestly, the resolution of every difference map and the common cutoff
+    for the SVD.
+
+    Returns a dict:
+      per_map        {Path -> float}  resolution each dFo map is computed at
+      eff            {Path -> float}  honest (completeness-based) limit per file
+      nominal        {Path -> float}  header resolution_high() per file (for the recap)
+      svd_dmin       float            common cutoff the SVD truncates every map to
+      svd_excluded   set[str]         source MTZ names dropped from the SVD (maps kept)
+      svd_info       dict             gap / median-step diagnostics
+      forced         float | None     the single value if the user forced --high-res
+
+    A difference map is limited by the POORER of its two datasets, so each map's
+    resolution is max(eff[target], eff[ref]). --high-res (forced) overrides
+    everything: one value for every map and the SVD, no outlier rejection.
+    """
+    nominal = {m: _safe_res(detect_resolution_limit, m) for m in mtz_files}
+
+    if forced is not None:
+        per_map = {m: forced for m in mtz_files}
+        return {"per_map": per_map, "eff": dict(nominal), "nominal": nominal,
+                "svd_dmin": forced, "svd_excluded": set(),
+                "svd_info": {"forced": True}, "forced": forced}
+
+    eff = {m: _safe_res(effective_resolution, m) for m in mtz_files}
+
+    # NaN-safe resolution: prefer honest, then nominal, then the series worst — a
+    # single failed detection must never write "high_resolution = nan" into phenix.
+    finite = [v for v in eff.values() if isinstance(v, (int, float)) and v == v]
+    series_worst = max(finite) if finite else float("nan")
+
+    def _res_or(*vals):
+        for v in vals:
+            if isinstance(v, (int, float)) and v == v:
+                return v
+        return series_worst
+
+    eff_ref = _res_or(eff.get(ref))
+    per_map = {m: round(max(_res_or(eff.get(m), nominal.get(m)), eff_ref), 4)
+               for m in mtz_files}
+
+    # SVD cutoff + outliers are decided over the TARGETS (every non-ref map that
+    # enters the SVD), using the resolution each map is actually computed at.
+    target_res = {m.name: per_map[m] for m in mtz_files if m != ref}
+    if target_res:
+        svd_dmin, svd_excluded, svd_info = svd_common_resolution(target_res)
+    else:
+        svd_dmin, svd_excluded, svd_info = per_map.get(ref, float("nan")), set(), {}
+
+    plan = {"per_map": per_map, "eff": eff, "nominal": nominal,
+            "svd_dmin": svd_dmin, "svd_excluded": svd_excluded,
+            "svd_info": svd_info, "forced": None}
+
+    print_honest_resolution_table(plan, mtz_files, ref)
+
+    # Resolution mode is an explicit choice because it has real consequences:
+    #   auto (per-map)   -> each map at its own honest resolution; sharpest
+    #                       individual maps. Peak width/volume scale with
+    #                       resolution, so these maps are NOT comparable across time.
+    #   uniform (one A)  -> every map at one resolution; the ONLY valid basis for
+    #                       comparing peaks/volumes across timepoints (SVD, kinetics).
+    # Enter defaults to the SAFE uniform cutoff (worst-common), NOT auto, so a
+    # stray keypress can't silently produce non-comparable maps. 'A' opts into auto.
+    worst = max(per_map.values()) if per_map else float("nan")
+    worst_ok = isinstance(worst, (int, float)) and worst == worst and worst > 0
+    if interactive:
+        print("\n  auto (per-map)    : sharpest individual maps — best for peak "
+              "VISUALISATION / inspecting one timepoint (not comparable across time).")
+        print("  uniform (1 cutoff): same resolution everywhere — needed to COMPARE "
+              "peaks/volumes across timepoints (SVD, volume kinetics).")
+        while True:
+            ans = _ask(f"\nResolution mode — Enter = uniform at {worst:.3f} A "
+                       f"(safe default) | a number = uniform at that cutoff | "
+                       f"'A' = auto per-map: ")
+            if not ans:                                  # Enter -> uniform @ worst-common
+                return (plan_resolutions(mtz_files, ref, worst, interactive=False)
+                        if worst_ok else plan)
+            if ans.strip().lower() in ("a", "auto"):     # A/a -> the auto per-map plan
+                print("  -> auto per-map resolution (best for visualisation).")
+                return plan
+            try:
+                forced_val = float(ans.replace(",", "."))
+            except ValueError:
+                print(f"  '{ans}' — type a resolution (e.g. 2.5), 'A' for auto, "
+                      f"or Enter for uniform.")
+                continue
+            if forced_val <= 0:
+                print("  Please give a positive resolution in A.")
+                continue
+            return plan_resolutions(mtz_files, ref, forced_val, interactive=False)
+    # Non-interactive: SAFE default is uniform at worst-common (auto is opt-in only,
+    # via the interactive 'A' choice), so headless/scripted runs never silently emit
+    # non-comparable per-map maps.
+    return (plan_resolutions(mtz_files, ref, worst, interactive=False)
+            if worst_ok else plan)
+
+
+def _safe_res(fn, mtz: Path) -> float:
+    try:
+        return fn(mtz)
+    except Exception as e:
+        print(f"WARNING: resolution detection failed for {mtz.name}: {e}")
+        return float("nan")
+
+
+def print_honest_resolution_table(plan: dict, mtz_files: list[Path], ref: Path) -> None:
+    nominal, eff, per_map = plan["nominal"], plan["eff"], plan["per_map"]
+    excluded, svd_dmin = plan["svd_excluded"], plan["svd_dmin"]
+    print("\nHonest resolution per MTZ  (nominal = header tip; honest = spherical "
+          f"{int(COMPLETENESS_MIN*100)}%-complete):")
+    print(f"  {'nominal':>8} {'honest':>8} {'map@':>8}   file")
+    for m in sorted(mtz_files, key=lambda x: per_map.get(x, 9e9)):
+        tags = []
+        if m == ref:
+            tags.append("reference")
+        if m.name in excluded:
+            tags.append("SVD-EXCLUDED (resolution outlier)")
+        nz = lambda v: f"{v:.3f}" if v == v else "  n/a"
+        print(f"  {nz(nominal.get(m)):>8} {nz(eff.get(m)):>8} "
+              f"{nz(per_map.get(m)):>8}   {m.name}"
+              + (f"   <- {', '.join(tags)}" if tags else ""))
+    info = plan.get("svd_info", {})
+    print(f"\nSVD common cutoff (all maps truncated to this on read): "
+          f"{svd_dmin:.3f} A" if svd_dmin == svd_dmin else "\nSVD common cutoff: n/a")
+    if excluded:
+        drp = ", ".join(f"{n} ({r:.2f} A)" for n, r in info.get("dropped", []))
+        print(f"  Dropped from SVD as resolution outliers (maps still made): {drp}")
+    elif info.get("note"):
+        print(f"  {info['note']}")            # e.g. a genuine two-regime spread
+    else:
+        print("  No resolution outliers — every timepoint is in the SVD.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1440,12 +1763,41 @@ def build_map_pdf(map_name: str, peaks: list[Peak], images: list[Path],
     print(f"    report: {pdf_path}")
 
 
+def map_quality_verdict(r: dict) -> str:
+    """Short human verdict for a difference map's usability (Feature 3).
+
+    Warns rather than rejects: even a flagged map is still made and tabulated.
+    """
+    parts = []
+    if r.get("in_svd") is False:
+        parts.append("SVD-excluded (resolution outlier)")
+    if r.get("iso_status") == "FAIL":
+        parts.append("non-isomorphous cell")
+    elif r.get("iso_status") == "WARN":
+        parts.append("cell drift")
+    nom, eff = r.get("resolution"), r.get("eff_resolution")
+    try:
+        if nom is not None and eff is not None and (eff - nom) > 0.3:
+            parts.append(f"anisotropic (honest {eff:.2f} vs header {nom:.2f} A)")
+    except (TypeError, ValueError):
+        pass
+    sc = r.get("scaling") or {}
+    cc = sc.get("cc_overall")
+    if cc is not None and cc < 0.85:
+        parts.append(f"weak dataset agreement (CC {cc:.2f})")
+    return "; ".join(parts) if parts else "OK"
+
+
 def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
-                       radius: float) -> None:
+                       radius: float, svd_info: dict | None = None) -> None:
     """
     One higher-level file across the whole series so you don't open every PDF.
     Contains: best peak + S/N per timepoint, SV weights, persistent-site table
     (recurrence + rising/decaying/flickering trend), and active-site hits.
+
+    *svd_info* (optional) reports the resolution scope of the joint SVD: the common
+    cutoff every map was truncated to and which timepoints were left out as
+    resolution outliers (Feature 2/3). Their individual maps are still present.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1485,7 +1837,12 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
     if have_quality:
         pd.DataFrame([{
             "timepoint": r["name"],
-            "resolution (A)": _r(r.get("resolution"), 2),
+            "nominal res (A)": _r(r.get("resolution"), 2),
+            "honest res (A)": _r(r.get("eff_resolution"), 2),
+            "map computed at (A)": _r(r.get("map_reslim"), 2),
+            "in SVD?": ("yes" if r.get("in_svd") else
+                        ("no" if r.get("in_svd") is False else "-")),
+            "quality": map_quality_verdict(r),
             "unit cell (a b c / al be ga)": cell_str(r.get("iso", {}).get("cell")),
             "unit-cell change (%)": _r(r.get("iso", {}).get("max_edge_pct"), 2),
             "angle change (deg)": _r(r.get("iso", {}).get("max_angle_deg"), 2),
@@ -1506,37 +1863,45 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
             ax.axis("off")
             ax.set_title("Map-quality checklist", fontsize=15, weight="bold", pad=16)
             cell_text = []
+            _f = lambda v, n=2: (f"{v:.{n}f}" if isinstance(v, (int, float)) and v == v else "-")
             for r in dfo_results:
                 iso = r.get("iso", {})
                 sc  = r.get("scaling") or {}
+                in_svd = ("yes" if r.get("in_svd") else
+                          ("NO" if r.get("in_svd") is False else "-"))
                 cell_text.append([
-                    r["name"][:20],
-                    f"{r['resolution']:.2f}" if r.get("resolution") else "-",
-                    cell_str(iso.get("cell")),
-                    f"{iso.get('max_edge_pct', float('nan')):.2f}",
+                    r["name"][:18],
+                    _f(r.get("resolution")),
+                    _f(r.get("eff_resolution")),
+                    _f(r.get("map_reslim")),
+                    in_svd,
                     r.get("iso_status", "-"),
-                    f"{sc['cc_overall']:.3f}" if sc.get("cc_overall") is not None else "-",
-                    f"{sc['r_overall']:.3f}" if sc.get("r_overall") is not None else "-",
-                    f"{r.get('cutoff', float('nan')):.2f}",
+                    _f(sc.get("cc_overall"), 3),
+                    _f(r.get("cutoff")),
                 ])
             tbl = ax.table(cellText=cell_text,
-                           colLabels=["timepoint", "res (Å)", "unit cell (a b c/α β γ)",
-                                      "cell Δ%", "same form?", "agree CC", "agree R",
+                           colLabels=["timepoint", "nominal\nres (Å)", "honest\nres (Å)",
+                                      "map@\n(Å)", "in SVD?", "same\nform?", "agree\nCC",
                                       "peak σ"],
                            loc="upper center", cellLoc="center")
-            tbl.auto_set_font_size(False); tbl.set_fontsize(6.5); tbl.scale(1, 1.4)
-            # colour the "same form?" cell by status
-            status_col = 4
+            tbl.auto_set_font_size(False); tbl.set_fontsize(6.5); tbl.scale(1, 1.6)
+            # colour the "same form?" and "in SVD?" cells by status
+            form_col, svd_col = 5, 4
             for ridx, r in enumerate(dfo_results, start=1):
                 s = r.get("iso_status", "-")
                 col = {"OK": "#c8f7c5", "WARN": "#ffe9a8", "FAIL": "#f7bcbc"}.get(s)
                 if col:
-                    tbl[(ridx, status_col)].set_facecolor(col)
+                    tbl[(ridx, form_col)].set_facecolor(col)
+                if r.get("in_svd") is False:
+                    tbl[(ridx, svd_col)].set_facecolor("#f7bcbc")
             ax.text(0.05, 0.02,
-                    "cell Δ% = largest unit-cell edge change vs the reference dataset;  "
-                    "same crystal form: OK <0.5% / WARN <1% / FAIL otherwise.  "
-                    "agree CC/R = how well the two datasets of each difference map agree.",
-                    fontsize=6.5, style="italic", transform=ax.transAxes)
+                    "nominal res = header high-res (ellipsoid tip for staraniso);  "
+                    "honest res = spherical "
+                    f"{int(COMPLETENESS_MIN*100)}%-complete limit (governs the map);  "
+                    "map@ = resolution this map was computed at.  "
+                    "in SVD? = whether the map entered the joint SVD (NO = resolution "
+                    "outlier, map still made).  same form: OK <0.5% / WARN <1% / FAIL.",
+                    fontsize=6, style="italic", transform=ax.transAxes, wrap=True)
             pdf.savefig(fig); plt.close(fig)
 
         # ── Page 2: peak / SVD summary ───────────────────────────────────
@@ -1545,6 +1910,29 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
         ax.set_title("TR-FRX series recap", fontsize=15, weight="bold", pad=16)
 
         y = 0.94
+        # ── Resolution & SVD scope (Feature 2/3) ─────────────────────────
+        if svd_info:
+            ax.text(0.05, y, "Resolution & SVD scope", fontsize=12, weight="bold")
+            y -= 0.026
+            cd = svd_info.get("common_dmin")
+            if svd_info.get("forced"):
+                ax.text(0.06, y, f"Forced single cutoff: {cd:.3f} A "
+                                 f"(every map + SVD).",
+                        fontsize=8, family="monospace"); y -= 0.020
+            elif cd is not None and cd == cd:
+                ax.text(0.06, y, f"Each map at its own honest resolution; "
+                                 f"SVD truncates all maps to {cd:.3f} A.",
+                        fontsize=8, family="monospace"); y -= 0.020
+            excl = svd_info.get("excluded") or []
+            if excl:
+                ax.text(0.06, y, f"Excluded from SVD as resolution outliers "
+                                 f"(maps still made): {', '.join(excl)[:80]}",
+                        fontsize=8, family="monospace", color="#b00020"); y -= 0.020
+            else:
+                ax.text(0.06, y, "No resolution outliers — all timepoints in the SVD.",
+                        fontsize=8, family="monospace"); y -= 0.020
+            y -= 0.012
+
         ax.text(0.05, y, "Best peak per timepoint  (map: best-sigma @ res | S/N)",
                 fontsize=12, weight="bold"); y -= 0.028
         for r in dfo_results:
@@ -1670,16 +2058,28 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
     """
     Submit the series to SLURM, reusing the TR-FRX_autoPROC_cbf.sh pattern:
     one job per source MTZ (diffmap + peak analysis), then a final SVD+recap
-    job chained with --dependency=afterok. Non-interactive: reslim is fixed.
+    job chained with --dependency=afterok.
+
+    The resolution plan decided by the submitting process is carried to the jobs:
+    each per-map job gets its OWN honest resolution via --high-res (Feature 1), and
+    the final SVD job gets the common cutoff + the resolution outliers to leave out
+    via --svd-high-res / --svd-exclude (Feature 2). Cluster runs therefore behave
+    exactly like local runs. *reslim* is the fallback used when no plan is present.
     """
     jobs_dir = work_dir / "pipeline_jobs"
     jobs_dir.mkdir(exist_ok=True)
     script = Path(__file__).resolve()
     py     = sys.executable
 
+    plan     = getattr(args, "res_plan", None) or {}
+    per_map  = plan.get("per_map") or {}
+    svd_dmin = getattr(args, "svd_dmin", None) or reslim
+    excluded = sorted(getattr(args, "svd_excluded", set()) or set())
+
     common = (f"--dir {work_dir} --ref {ref} --sigma {args.sigma} "
-              f"--radius {args.radius} --n-peaks {args.n_peaks} "
-              f"--high-res {reslim}")
+              f"--radius {args.radius} --n-peaks {args.n_peaks}")
+    if args.time_step is not None:
+        common += f" --time-step {args.time_step}"   # SVD x-axis in ms + SV0 tau fit
     if args.skip_images:
         common += " --skip-images"
     if args.active_site:
@@ -1690,6 +2090,10 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
     for mtz in mtz_files:
         if mtz == ref:
             continue
+        # Feature 1 on the cluster: this map's OWN honest resolution.
+        map_res = per_map.get(mtz, svd_dmin)
+        tag = " (SVD-excluded outlier; map still made)" if mtz.name in excluded else ""
+        print(f"  {mtz.name}: map at {map_res:.3f} A{tag}")
         js = jobs_dir / f"peaks_{mtz.stem}.sh"
         js.write_text(
             "#!/bin/bash\nset -euo pipefail\n"
@@ -1697,7 +2101,7 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
             "unset PYTHONHOME PYTHONPATH DISPLAY || true\n"  # no X11 in batch jobs
             "export MPLBACKEND=Agg\n"
             f"cd {work_dir}\n"
-            f"{py} {script} {common} --only {mtz.name}\n"
+            f"{py} {script} {common} --high-res {map_res} --only {mtz.name}\n"
         )
         if args.dry_run:
             print(f"  [dry-run] sbatch {js}")
@@ -1710,13 +2114,22 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
             dep_ids.append(jid)
             print(f"  submitted {js.name} -> job {jid}")
 
-    # Final SVD + recap job, depends on all diffmap jobs
+    # Final SVD + recap job, depends on all diffmap jobs.
+    # Feature 2 on the cluster: the joint SVD truncates every map to one common
+    # cutoff and leaves resolution outliers out (their maps are already made above).
+    svd_flags = f" --svd-high-res {svd_dmin}"
+    if excluded:
+        svd_flags += " --svd-exclude " + " ".join(excluded)
+        print(f"  SVD job: common cutoff {svd_dmin:.3f} A, "
+              f"excluding {len(excluded)} resolution outlier(s): {', '.join(excluded)}")
+    else:
+        print(f"  SVD job: common cutoff {svd_dmin:.3f} A, no resolution outliers")
     final = jobs_dir / "svd_recap.sh"
     final.write_text(
         "#!/bin/bash\nset -euo pipefail\n"
         "module load phenix ccp4 pymol 2>/dev/null || true\n"
         f"cd {work_dir}\n"
-        f"{py} {script} {common} --svd-only\n"
+        f"{py} {script} {common}{svd_flags} --svd-only\n"
     )
     if args.dry_run:
         print(f"  [dry-run] sbatch --dependency=afterok:<all> {final}")
@@ -1788,6 +2201,13 @@ def _legacy_pipeline_parser() -> argparse.ArgumentParser:
                         help=argparse.SUPPRESS)          # process one source MTZ
     parser.add_argument("--svd-only", action="store_true",
                         help=argparse.SUPPRESS)          # SVD + SVD-map peaks + recap
+    # Cluster mode carries the resolution plan to the final SVD job through these
+    # (the --svd-only job returns before resolution planning, so it cannot redo it).
+    parser.add_argument("--svd-high-res", type=float, default=None,
+                        help=argparse.SUPPRESS)          # common cutoff for the joint SVD
+    parser.add_argument("--svd-exclude", nargs="*", default=None, metavar="MTZ",
+                        help=argparse.SUPPRESS)          # resolution outliers: maps kept,
+                                                         # left out of the joint SVD only
     return parser
 
 
@@ -1839,6 +2259,19 @@ def run_pipeline(args) -> int:
 
     # ── SVD-only mode (cluster final job) ────────────────────────────────
     if args.svd_only:
+        # This job returns before resolution planning, so the plan cannot be
+        # recomputed here — the submitting process passes it in explicitly.
+        # Without it the joint SVD would silently include resolution outliers.
+        args.svd_dmin     = args.svd_high_res
+        args.svd_excluded = set(args.svd_exclude or [])
+        args.res_plan     = {"svd_info": {"dropped": [(n, float("nan"))
+                                                      for n in args.svd_excluded]},
+                             "forced": None}
+        if args.svd_dmin:
+            print(f"SVD scope (from submitting job): common cutoff "
+                  f"{args.svd_dmin:.3f} A"
+                  + (f", excluding {len(args.svd_excluded)} resolution outlier(s)"
+                     if args.svd_excluded else ""))
         rc = _run_svd_and_peaks(out_dfo, out_svd, model, args, make_images)
         # This is the last job of a --cluster run: build the HTML report now
         # that all per-timepoint jobs have finished.
@@ -1849,30 +2282,38 @@ def run_pipeline(args) -> int:
                 print(f"  HTML report skipped ({e})")
         return rc
 
-    # ── Resolution (Feature 1) ───────────────────────────────────────────
-    if args.high_res is not None:
-        reslim = args.high_res
-        print(f"Resolution (user-specified): {reslim} A")
+    # ── Resolution: honest per-map limits + unbiased-SVD common cutoff ────
+    #   Feature 1 : each map is computed at its OWN honest (completeness-based)
+    #               resolution — good timepoints stay sharp, decayed ones stay
+    #               honest, nothing is rejected.
+    #   Feature 2 : the SVD truncates every map to ONE common cutoff and drops
+    #               resolution OUTLIERS from the joint decomposition only (their
+    #               individual maps are still made and still land in the recap).
+    #   --high-res forces one value for every map and the SVD (no outlier drop).
+    interactive = sys.stdin.isatty() and args.only is None
+    try:
+        plan = plan_resolutions(mtz_files, ref, args.high_res, interactive)
+    except Exception as e:
+        print(f"ERROR: resolution planning failed: {e}")
+        return 1
+    per_map           = plan["per_map"]
+    args.svd_dmin     = plan["svd_dmin"]
+    args.svd_excluded = plan["svd_excluded"]        # source MTZ names dropped from SVD
+    args.res_plan     = plan                         # carried into the recap
+    if plan["forced"] is not None:
+        print(f"  -> All difference maps use {plan['forced']} A (forced).\n")
     else:
-        res_values = resolution_table(mtz_files)
-        if not res_values:
-            print("ERROR: could not detect resolution for any MTZ. Use --high-res.")
-            return 1
-        # Prompt on any interactive terminal — including when SUBMITTING to the
-        # cluster (the chosen resolution is then baked into every job via
-        # --high-res). The per-map jobs themselves pass --high-res, so they never
-        # reach this branch and never block on input.
-        interactive = sys.stdin.isatty() and args.only is None
-        reslim, mtz_files = prompt_resolution_choice(mtz_files, res_values, interactive)
-        if ref not in mtz_files and args.only is None:
-            mtz_files = [ref] + mtz_files       # keep reference available
-    print(f"  -> All difference maps use {reslim} A.\n")
+        print(f"  -> Each map at its own honest resolution; "
+              f"SVD common cutoff {args.svd_dmin:.3f} A.\n")
 
     merge_radius = args.merge_radius if args.merge_radius else max(MERGE_RADIUS_MIN, 0.0)
 
     # ── Cluster mode (optional) ──────────────────────────────────────────
     if args.cluster:
-        return submit_cluster(work_dir, mtz_files, ref, reslim, args)
+        # Cluster mirrors the local path: submit_cluster bakes each map's OWN
+        # honest resolution into its --only job (from args.res_plan) and passes
+        # the SVD common cutoff + outliers to the final --svd-only job.
+        return submit_cluster(work_dir, mtz_files, ref, args.svd_dmin, args)
 
     if not args.dry_run:
         out_dfo.mkdir(exist_ok=True)
@@ -1898,7 +2339,9 @@ def run_pipeline(args) -> int:
                 print(f"  diffmap exists, reusing: {existing[0].name}")
                 skipped += 1
             else:
-                compute_diffmap(mtz, ref, model, labels, reslim, args.dry_run,
+                map_reslim = per_map.get(mtz, args.svd_dmin)
+                print(f"  honest resolution for this map: {map_reslim:.3f} A")
+                compute_diffmap(mtz, ref, model, labels, map_reslim, args.dry_run,
                                 out_dfo, log_dir=logs_dir)
                 ok += 1
             if not args.dry_run:
@@ -1914,7 +2357,10 @@ def run_pipeline(args) -> int:
                         iso = cell_isomorphism(mtz, ref)
                         result["iso"] = iso
                         result["iso_status"] = isomorphism_status(iso)
-                        result["resolution"] = detect_resolution_limit(mtz)
+                        result["resolution"]     = plan["nominal"].get(mtz) or detect_resolution_limit(mtz)
+                        result["eff_resolution"] = plan["eff"].get(mtz)
+                        result["map_reslim"]     = per_map.get(mtz)
+                        result["in_svd"]         = mtz.name not in args.svd_excluded
                         result["scaling"] = parse_fobs_agreement(
                             logs_dir / f"{mtz.stem}-{ref.stem}_diffmap.log")
                     except Exception as e:
@@ -1938,7 +2384,8 @@ def run_pipeline(args) -> int:
     if args.skip_svd:
         if dfo_results:
             build_series_recap(dfo_results, None,
-                               out_dfo / "series_recap.pdf", args.radius)
+                               out_dfo / "series_recap.pdf", args.radius,
+                               svd_info=_svd_scope_info(args))
         return 0 if failed == 0 else 2
 
     rc = _run_svd_and_peaks(out_dfo, out_svd, model, args, make_images,
@@ -1946,12 +2393,31 @@ def run_pipeline(args) -> int:
     return rc if failed == 0 else 2
 
 
+def _svd_scope_info(args) -> dict:
+    """Resolution/SVD-scope summary for the recap (common cutoff + excluded outliers)."""
+    plan = getattr(args, "res_plan", None) or {}
+    return {
+        "common_dmin": getattr(args, "svd_dmin", None),
+        "excluded": sorted(getattr(args, "svd_excluded", set()) or set()),
+        "gap_info": plan.get("svd_info", {}),
+        "forced": plan.get("forced"),
+    }
+
+
 def _run_svd_and_peaks(out_dfo: Path, out_svd: Path, model: Path, args,
                        make_images: bool, st=None, dfo_results=None) -> int:
     """Run SVD, analyse the SVD component maps, then build the series recap."""
     print("Running SVD...")
+    common_dmin   = getattr(args, "svd_dmin", None)
+    excluded      = getattr(args, "svd_excluded", set()) or set()
+    exclude_stems = {Path(n).stem for n in excluded}     # source MTZ names -> stems
+    if common_dmin and common_dmin == common_dmin:
+        print(f"  SVD: common cutoff {common_dmin:.3f} A"
+              + (f", excluding {len(exclude_stems)} resolution outlier(s)"
+                 if exclude_stems else ""))
     try:
-        sv_values = run_svd(out_dfo, out_svd, args.time_step)
+        sv_values = run_svd(out_dfo, out_svd, args.time_step,
+                            common_dmin=common_dmin, exclude_stems=exclude_stems)
     except Exception as e:
         print(f"SVD ERROR: {e}")
         return 2
@@ -1969,7 +2435,8 @@ def _run_svd_and_peaks(out_dfo: Path, out_svd: Path, model: Path, args,
         dfo_results = _recap_from_existing(out_dfo, st, model, args, merge_radius)
     if dfo_results:
         build_series_recap(dfo_results, sv_values,
-                           out_svd / "series_recap.pdf", args.radius)
+                           out_svd / "series_recap.pdf", args.radius,
+                           svd_info=_svd_scope_info(args))
     return 0
 
 
@@ -1978,13 +2445,25 @@ def _recap_from_existing(out_dfo: Path, st, model: Path, args,
     """Light re-scan of existing dFo maps for the recap (svd-only path)."""
     results = []
     reports_dfo = out_dfo / "reports"
+    # Source MTZ names of the resolution outliers -> stems, so the recap can still
+    # flag which maps were left out of the joint SVD on the cluster path.
+    excl_stems = {Path(n).stem for n in (getattr(args, "svd_excluded", set()) or set())}
     for dfo in sorted(out_dfo.glob("dFo_*_1.mtz")):
         try:
-            results.append(
-                analyze_map(dfo, st, model, args.sigma, args.radius,
+            r = analyze_map(dfo, st, model, args.sigma, args.radius,
                             merge_radius, args.n_peaks, reports_dfo, False,
                             active_site=args.active_site,
-                            display_sigma=args.display_sigma))
+                            display_sigma=args.display_sigma)
+            if excl_stems:
+                r["in_svd"] = not any(dfo.stem.startswith(f"dFo_{s}_")
+                                      or dfo.stem == f"dFo_{s}" for s in excl_stems)
+            try:                      # resolution the map was actually computed at
+                import gemmi
+                r["map_reslim"] = round(
+                    gemmi.read_mtz_file(str(dfo)).resolution_high(), 3)
+            except Exception:
+                pass
+            results.append(r)
         except Exception as e:
             print(f"  recap: skipping {dfo.name} ({e})")
     return results
