@@ -181,6 +181,7 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 --cluster                  # dimple via srun + diffmaps via sbatch (SLURM)
 --name D1                  # skip the dataset-name prompt
 --file staraniso|truncate  # skip the structure-factor-file prompt
+--high-res 2.5             # force ONE uniform resolution (A) for every map + SVD
 --dry-run                  # print the plan for every stage, do nothing
 --resume                   # reuse the latest run_NN, skip finished work
 --start-stage analyze      # re-run only the analysis (retune) into a new run_NN
@@ -194,6 +195,36 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 > **On a cluster:** `--cluster` runs `dimple` on a compute node via `srun`
 > (streamed live) and submits the difference maps as parallel `sbatch` jobs; the
 > final job writes `report.html` once every timepoint has finished.
+
+### Choosing the map resolution (auto vs uniform)
+
+Before computing the difference maps, the pipeline measures each timepoint's
+**honest resolution** — the resolution where the data is still spherically
+~90 % complete — instead of trusting the header high-resolution limit (which,
+for STARANISO files, is the optimistic *tip* of the anisotropic ellipsoid). It
+then asks for a **resolution mode**:
+
+| Mode | How to pick | Every map computed at | Best for |
+|---|---|---|---|
+| **uniform** | press **Enter** (worst-common), type a number, or `--high-res X` | one shared cutoff | **comparing** peaks / volumes across timepoints (SVD, kinetics) |
+| **auto (per-map)** | type **`A`** at the prompt | its own honest resolution | **visualising** the sharpest map at a single timepoint |
+
+> [!IMPORTANT]
+> Peak height, width and **integrated volume scale with resolution**, so maps at
+> different resolutions are **not comparable across timepoints**. For any
+> cross-timepoint or kinetic analysis (peak-volume integration, the SVD) use
+> **uniform**. Reserve **auto** for eyeballing individual high-resolution
+> timepoints. `Enter` and headless/`--cluster` non-interactive runs default to
+> uniform for this reason.
+
+**SVD is always unbiased.** Whatever mode you pick, the SVD truncates every map
+to one common resolution and automatically **drops resolution outliers** — a
+lone, much-lower-resolution timepoint (e.g. from radiation-damage decay) that
+would blur every component — from the decomposition; that timepoint's individual
+map is still produced. The `report.html` map-quality table lists each
+timepoint's nominal vs honest resolution, the resolution its map was computed at,
+whether it entered the SVD, and a short quality verdict
+(outlier / anisotropic / weak dataset agreement).
 
 ---
 
