@@ -817,18 +817,14 @@ def plan_resolutions(mtz_files: list[Path], ref: Path,
       forced         float | None     the single value if the user forced --high-res
 
     A difference map is limited by the POORER of its two datasets, so each map's
-    resolution is max(eff[target], eff[ref]). --high-res (forced) overrides
-    everything: one value for every map and the SVD, no outlier rejection.
+    resolution is max(eff[target], eff[ref]). Uniform mode (--high-res or the
+    prompt's Enter/number) puts every COMPARABLE map at one cutoff but still drops
+    genuine resolution outliers from the SVD (only those that cannot reach the
+    cutoff); their individual maps are still made at their own honest resolution.
+    The uniform default is the worst NON-outlier, never the outlier itself.
     """
     nominal = {m: _safe_res(detect_resolution_limit, m) for m in mtz_files}
-
-    if forced is not None:
-        per_map = {m: forced for m in mtz_files}
-        return {"per_map": per_map, "eff": dict(nominal), "nominal": nominal,
-                "svd_dmin": forced, "svd_excluded": set(),
-                "svd_info": {"forced": True}, "forced": forced}
-
-    eff = {m: _safe_res(effective_resolution, m) for m in mtz_files}
+    eff     = {m: _safe_res(effective_resolution, m) for m in mtz_files}
 
     # NaN-safe resolution: prefer honest, then nominal, then the series worst — a
     # single failed detection must never write "high_resolution = nan" into phenix.
@@ -842,19 +838,36 @@ def plan_resolutions(mtz_files: list[Path], ref: Path,
         return series_worst
 
     eff_ref = _res_or(eff.get(ref))
-    per_map = {m: round(max(_res_or(eff.get(m), nominal.get(m)), eff_ref), 4)
-               for m in mtz_files}
+    # Per-map honest resolution (auto mode): a diff map is limited by the POORER of
+    # its two datasets, hence max(eff[target], eff[ref]).
+    honest   = {m: round(max(_res_or(eff.get(m), nominal.get(m)), eff_ref), 4)
+                for m in mtz_files}
+    name_eff = {m.name: _res_or(eff.get(m), nominal.get(m)) for m in mtz_files}
 
-    # SVD cutoff + outliers are decided over the TARGETS (every non-ref map that
-    # enters the SVD), using the resolution each map is actually computed at.
-    target_res = {m.name: per_map[m] for m in mtz_files if m != ref}
+    # Gap-rule resolution outliers over the TARGETS, at their honest resolutions.
+    # auto_dmin is the worst NON-outlier — the sensible common cutoff for BOTH modes.
+    target_res = {m.name: honest[m] for m in mtz_files if m != ref}
     if target_res:
-        svd_dmin, svd_excluded, svd_info = svd_common_resolution(target_res)
+        auto_dmin, auto_excluded, svd_info = svd_common_resolution(target_res)
     else:
-        svd_dmin, svd_excluded, svd_info = per_map.get(ref, float("nan")), set(), {}
+        auto_dmin, auto_excluded, svd_info = honest.get(ref, float("nan")), set(), {}
 
-    plan = {"per_map": per_map, "eff": eff, "nominal": nominal,
-            "svd_dmin": svd_dmin, "svd_excluded": svd_excluded,
+    if forced is not None:
+        # Uniform: comparable maps are computed at `forced`. Genuine resolution
+        # outliers are STILL dropped from the SVD (just as in auto mode) — but only
+        # those that cannot reach the chosen cutoff, since a COARSER cutoff can
+        # legitimately re-include them. An excluded map keeps its own honest
+        # resolution (its individual map is for inspection, not the SVD).
+        excluded = {n for n in auto_excluded
+                    if name_eff.get(n, series_worst) > forced + 1e-4}
+        per_map = {m: (honest[m] if m.name in excluded else forced) for m in mtz_files}
+        return {"per_map": per_map, "eff": eff, "nominal": nominal,
+                "svd_dmin": forced, "svd_excluded": excluded,
+                "svd_info": {**svd_info, "forced": True}, "forced": forced}
+
+    # ── Auto per-map plan ────────────────────────────────────────────────
+    plan = {"per_map": honest, "eff": eff, "nominal": nominal,
+            "svd_dmin": auto_dmin, "svd_excluded": auto_excluded,
             "svd_info": svd_info, "forced": None}
 
     print_honest_resolution_table(plan, mtz_files, ref)
@@ -863,24 +876,27 @@ def plan_resolutions(mtz_files: list[Path], ref: Path,
     #   auto (per-map)   -> each map at its own honest resolution; sharpest
     #                       individual maps. Peak width/volume scale with
     #                       resolution, so these maps are NOT comparable across time.
-    #   uniform (one A)  -> every map at one resolution; the ONLY valid basis for
-    #                       comparing peaks/volumes across timepoints (SVD, kinetics).
-    # Enter defaults to the SAFE uniform cutoff (worst-common), NOT auto, so a
-    # stray keypress can't silently produce non-comparable maps. 'A' opts into auto.
-    worst = max(per_map.values()) if per_map else float("nan")
-    worst_ok = isinstance(worst, (int, float)) and worst == worst and worst > 0
+    #   uniform (one A)  -> every comparable map at one resolution; the ONLY valid
+    #                       basis for comparing peaks/volumes across time (SVD).
+    # The uniform default is the worst NON-outlier (= auto_dmin): a lone very-low-res
+    # timepoint must NOT drag every map down, so it is dropped from the SVD in
+    # uniform mode too (its own map is still made). Enter defaults to uniform, NOT
+    # auto, so a stray keypress can't silently produce non-comparable maps.
+    uniform_default = auto_dmin
+    ud_ok = (isinstance(uniform_default, (int, float))
+             and uniform_default == uniform_default and uniform_default > 0)
     if interactive:
         print("\n  auto (per-map)    : sharpest individual maps — best for peak "
               "VISUALISATION / inspecting one timepoint (not comparable across time).")
         print("  uniform (1 cutoff): same resolution everywhere — needed to COMPARE "
               "peaks/volumes across timepoints (SVD, volume kinetics).")
         while True:
-            ans = _ask(f"\nResolution mode — Enter = uniform at {worst:.3f} A "
-                       f"(safe default) | a number = uniform at that cutoff | "
-                       f"'A' = auto per-map: ")
-            if not ans:                                  # Enter -> uniform @ worst-common
-                return (plan_resolutions(mtz_files, ref, worst, interactive=False)
-                        if worst_ok else plan)
+            ans = _ask(f"\nResolution mode — Enter = uniform at {uniform_default:.3f} A "
+                       f"(worst non-outlier; safe default) | a number = uniform at that "
+                       f"cutoff | 'A' = auto per-map (each map at its own 'map@' above): ")
+            if not ans:                                  # Enter -> uniform @ worst non-outlier
+                return (plan_resolutions(mtz_files, ref, uniform_default, interactive=False)
+                        if ud_ok else plan)
             if ans.strip().lower() in ("a", "auto"):     # A/a -> the auto per-map plan
                 print("  -> auto per-map resolution (best for visualisation).")
                 return plan
@@ -894,11 +910,11 @@ def plan_resolutions(mtz_files: list[Path], ref: Path,
                 print("  Please give a positive resolution in A.")
                 continue
             return plan_resolutions(mtz_files, ref, forced_val, interactive=False)
-    # Non-interactive: SAFE default is uniform at worst-common (auto is opt-in only,
-    # via the interactive 'A' choice), so headless/scripted runs never silently emit
+    # Non-interactive: SAFE default is uniform at the worst non-outlier (auto is an
+    # interactive 'A' opt-in only), so headless/scripted runs never silently emit
     # non-comparable per-map maps.
-    return (plan_resolutions(mtz_files, ref, worst, interactive=False)
-            if worst_ok else plan)
+    return (plan_resolutions(mtz_files, ref, uniform_default, interactive=False)
+            if ud_ok else plan)
 
 
 def _safe_res(fn, mtz: Path) -> float:
@@ -2289,7 +2305,8 @@ def run_pipeline(args) -> int:
     #   Feature 2 : the SVD truncates every map to ONE common cutoff and drops
     #               resolution OUTLIERS from the joint decomposition only (their
     #               individual maps are still made and still land in the recap).
-    #   --high-res forces one value for every map and the SVD (no outlier drop).
+    #   Uniform mode (--high-res / prompt) puts comparable maps at one cutoff and
+    #               STILL drops outliers that can't reach it.
     interactive = sys.stdin.isatty() and args.only is None
     try:
         plan = plan_resolutions(mtz_files, ref, args.high_res, interactive)
@@ -2301,7 +2318,10 @@ def run_pipeline(args) -> int:
     args.svd_excluded = plan["svd_excluded"]        # source MTZ names dropped from SVD
     args.res_plan     = plan                         # carried into the recap
     if plan["forced"] is not None:
-        print(f"  -> All difference maps use {plan['forced']} A (forced).\n")
+        nexc = len(args.svd_excluded)
+        extra = (f"  ({nexc} resolution outlier(s) kept out of the SVD)"
+                 if nexc else "")
+        print(f"  -> Uniform {plan['forced']} A for all comparable maps.{extra}\n")
     else:
         print(f"  -> Each map at its own honest resolution; "
               f"SVD common cutoff {args.svd_dmin:.3f} A.\n")
