@@ -206,7 +206,7 @@ then asks for a **resolution mode**:
 
 | Mode | How to pick | Every map computed at | Best for |
 |---|---|---|---|
-| **uniform** | press **Enter** (worst-common), type a number, or `--high-res X` | one shared cutoff | **comparing** peaks / volumes across timepoints (SVD, kinetics) |
+| **uniform** | press **Enter** (worst non-outlier), type a number, or `--high-res X` | one shared cutoff | **comparing** peaks / volumes across timepoints (SVD, kinetics) |
 | **auto (per-map)** | type **`A`** at the prompt | its own honest resolution | **visualising** the sharpest map at a single timepoint |
 
 > [!IMPORTANT]
