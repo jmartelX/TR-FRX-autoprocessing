@@ -707,108 +707,124 @@ def _pct_change_series(rows, col):
     return xs, [100.0 * (y - base) / base for y in ys]
 
 
+# Colour palette (Tol "bright", teal as the 3rd colour). Applied per panel by
+# series order; dashes are used ONLY where two lines would coincide (cell edge b
+# on a, images used on requested). Everything else is a solid continuous step.
+_PALETTE = ["#4477AA", "#EE6677", "#44AA99"]
+_SOLID   = "-"
+_DASH    = (0, (4, 2.2))
+_INK, _MUT, _GRID, _SPINE = "#1a2530", "#5c6b76", "#eceff2", "#c4ced4"
+
+
+def _step_xy(rows, col, pct=False):
+    """(xs, ys) tracing a continuous STEP line: the value is held flat across each
+    chunk's image window [image_first, image_last] and steps at every boundary, so
+    a value is never placed at a single ambiguous x (it spans the window it was
+    measured over). Drops N/A. *pct* expresses the series as % change from the
+    first window."""
+    vals = []
+    for r in rows:
+        d = dict(r)
+        y = to_float(d.get(col))
+        a = to_float(d.get("image_first"))
+        b = to_float(d.get("image_last"))
+        if y is None or a is None or b is None:
+            continue
+        vals.append((a, b, y))
+    if pct:
+        if not vals or vals[0][2] == 0:
+            return [], []
+        base = vals[0][2]
+        vals = [(a, b, 100.0 * (y - base) / base) for a, b, y in vals]
+    xs, ys = [], []
+    for a, b, y in vals:
+        xs += [a, b]
+        ys += [y, y]
+    return xs, ys
+
+
 def _damage_plots(pdf, plt, rows, dataset, title, wilson_method=""):
-    """Radiation-damage plots (metrics vs image number)."""
-    fig = plt.figure(figsize=(8.27, 11.69))
-    fig.suptitle("%s  —  %s\nradiation-damage indicators vs image number"
-                 % (dataset, title), fontsize=13, y=0.98)
-    xlabel = "Image number"
+    """Radiation-damage report page: one continuous step line per metric, drawn
+    flat across each image window (see _step_xy). Colour is by series order from
+    _PALETTE; dashes appear only to separate coincident lines. Panels: high-res
+    limit, R-factors, I/sigma, CC(1/2), Wilson B, cell edges & volume, images."""
+    fig = plt.figure(figsize=(8.4, 11.3))
+    fig.patch.set_facecolor("white")
+    fig.text(0.07, 0.972, dataset, fontsize=17, fontweight="bold", color=_INK)
+    fig.text(0.07, 0.9555,
+             "%s route  ·  radiation-damage indicators vs image number" % title,
+             fontsize=9, color=_MUT)
 
-    def ax_at(idx):
+    # tight x-range straight from the actual windows
+    xf = [to_float(dict(r).get("image_first")) for r in rows]
+    xl = [to_float(dict(r).get("image_last")) for r in rows]
+    xf = [v for v in xf if v is not None]
+    xl = [v for v in xl if v is not None]
+    x0 = min(xf) if xf else 0.0
+    x1 = max(xl) if xl else 1.0
+    xpad = 0.012 * ((x1 - x0) or 1.0)
+
+    C, SOL, DASH = _PALETTE, _SOLID, _DASH
+    # (panel title, y-label, invert-y, [(legend, column, pct, colour_idx, dash)])
+    panels = [
+        ("High-resolution limit", "d_high (Å)", True,
+            [("", "resolution_high", False, 0, SOL)]),
+        ("R-factors", "R", False,
+            [("Rmerge", "Rmerge", False, 0, SOL),
+             ("Rmeas", "Rmeas", False, 1, SOL),
+             ("Rpim", "Rpim", False, 2, SOL)]),
+        ("Mean I / σ(I)", "I/σ", False,
+            [("overall", "Mean_I_over_sigma", False, 0, SOL),
+             ("outer", "Mean_I_over_sigma_outer", False, 1, SOL)]),
+        ("CC½", "CC½", False,
+            [("overall", "CC_half", False, 0, SOL),
+             ("outer", "CC_half_outer", False, 1, SOL)]),
+        ("Wilson B-factor", "B (Å²)", False,
+            [("", "Wilson_B", False, 0, SOL)]),
+        ("Unit-cell edges", "Δ edge (%)", False,
+            [("a", "cell_a", True, 0, SOL),
+             ("b", "cell_b", True, 1, DASH),
+             ("c", "cell_c", True, 2, SOL)]),
+        ("Unit-cell volume", "ΔV (%)", False,
+            [("", "cell_volume", True, 0, SOL)]),
+        ("Images per chunk", "N images", False,
+            [("requested", "n_images", False, 0, SOL),
+             ("used", "images_used", False, 1, DASH)]),
+    ]
+
+    for idx, (ptitle, ylab, invert, specs) in enumerate(panels, 1):
         ax = fig.add_subplot(4, 2, idx)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=7)
-        ax.set_xlabel(xlabel, fontsize=7)
-        return ax
+        drew = False
+        for lab, col, pct, ci, dash in specs:
+            xs, ys = _step_xy(rows, col, pct)
+            if not xs:
+                continue
+            ax.plot(xs, ys, color=C[ci % len(C)], lw=1.8, ls=dash,
+                    label=(lab or None), solid_capstyle="round")
+            drew = True
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for sp in ("left", "bottom"):
+            ax.spines[sp].set_color(_SPINE)
+            ax.spines[sp].set_linewidth(0.9)
+        ax.grid(axis="y", color=_GRID, lw=0.9)
+        ax.set_axisbelow(True)
+        ax.tick_params(length=0, labelsize=7.5, colors=_MUT)
+        ax.set_title(ptitle, loc="left", fontsize=10.5, fontweight="bold",
+                     color=_INK, pad=7)
+        ax.set_ylabel(ylab, fontsize=8, color=_MUT)
+        ax.set_xlabel("image number", fontsize=8, color=_MUT)
+        ax.set_xlim(x0 - xpad, x1 + xpad)
+        if invert and drew:
+            ax.invert_yaxis()
+        if not drew:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    fontsize=8, color=_MUT, transform=ax.transAxes)
+        if sum(1 for s in specs if s[0]) > 1:
+            ax.legend(fontsize=7.5, frameon=False, loc="best", handlelength=2.0)
 
-    # 1) High-resolution limit vs dose. Y-axis inverted so that better
-    #    resolution (smaller d) is at the top: the curve then falls as damage
-    #    pushes the limit to higher d.
-    ax = ax_at(1)
-    xs, ys = _series(rows, "resolution_high")
-    if xs:
-        ax.plot(xs, ys, "o-", ms=3, color="C0")
-        ax.invert_yaxis()
-    ax.set_title("High-resolution limit (better = up)", fontsize=8)
-    ax.set_ylabel("d_high (A)", fontsize=7)
-
-    # 2) R-factors vs dose (rising = damage).
-    ax = ax_at(2)
-    for col, lab in [("Rmerge", "Rmerge"), ("Rmeas", "Rmeas"), ("Rpim", "Rpim")]:
-        xs, ys = _series(rows, col)
-        if xs:
-            ax.plot(xs, ys, "o-", ms=3, label=lab)
-    ax.set_title("R-factors (overall)", fontsize=8)
-    ax.set_ylabel("R", fontsize=7)
-    ax.legend(fontsize=6)
-
-    # 3) Mean I/sigma(I) vs dose (falling = damage).
-    ax = ax_at(3)
-    for col, lab in [("Mean_I_over_sigma", "overall"),
-                     ("Mean_I_over_sigma_outer", "outer shell")]:
-        xs, ys = _series(rows, col)
-        if xs:
-            ax.plot(xs, ys, "o-", ms=3, label=lab)
-    ax.set_title("Mean I / sigma(I)", fontsize=8)
-    ax.set_ylabel("I/sigma(I)", fontsize=7)
-    ax.legend(fontsize=6)
-
-    # 4) CC(1/2) vs dose (falling = damage).
-    ax = ax_at(4)
-    for col, lab in [("CC_half", "overall"), ("CC_half_outer", "outer shell")]:
-        xs, ys = _series(rows, col)
-        if xs:
-            ax.plot(xs, ys, "o-", ms=3, label=lab)
-    ax.set_title("CC(1/2)", fontsize=8)
-    ax.set_ylabel("CC(1/2)", fontsize=7)
-    ax.legend(fontsize=6)
-
-    # 5) Wilson B (global decay / B-scaling curve).
-    ax = ax_at(5)
-    xs, ys = _series(rows, "Wilson_B")
-    if xs:
-        ax.plot(xs, ys, "o-", ms=3, color="C3")
-    else:
-        ax.text(0.5, 0.5, "Wilson B unavailable", ha="center", va="center",
-                fontsize=7, transform=ax.transAxes)
-    ax.set_title(("Wilson B-factor\n(%s)" % wilson_method) if wilson_method
-                 else "Wilson B-factor", fontsize=6.5)
-    ax.set_ylabel("Wilson B (A^2)", fontsize=7)
-
-    # 6) Unit-cell edges, % change vs dose. Always draw all three edges; distinct
-    #    line styles/markers (and some transparency) keep 'a' visible even when a
-    #    symmetry constraint makes it coincide with another edge.
-    ax = ax_at(6)
-    for k, style in [("a", "o-"), ("b", "s--"), ("c", "^:")]:
-        xk, yk = _pct_change_series(rows, "cell_" + k)
-        if xk:
-            ax.plot(xk, yk, style, ms=3, alpha=0.8, label=k)
-    ax.set_title("Unit-cell edges (% change)", fontsize=8)
-    ax.set_ylabel("delta edge (%)", fontsize=7)
-    ax.legend(fontsize=6)
-
-    # 7) Unit-cell volume, % change vs dose.
-    ax = ax_at(7)
-    xs, ys = _pct_change_series(rows, "cell_volume")
-    if xs:
-        ax.plot(xs, ys, "o-", ms=3, color="C2")
-    ax.set_title("Unit-cell volume (% change)", fontsize=8)
-    ax.set_ylabel("delta V (%)", fontsize=7)
-
-    # 8) Images actually used per chunk vs dose.
-    ax = ax_at(8)
-    xs, ys = _series(rows, "images_used")
-    xr, yr = _series(rows, "n_images")
-    if xr:
-        ax.plot(xr, yr, "o--", ms=3, color="0.6", label="requested")
-    if xs:
-        ax.plot(xs, ys, "o-", ms=3, color="C1", label="used")
-    ax.set_title("Images per chunk", fontsize=8)
-    ax.set_ylabel("N images", fontsize=7)
-    ax.legend(fontsize=6)
-
-    fig.subplots_adjust(left=0.09, right=0.9, top=0.90, bottom=0.06,
-                        hspace=0.5, wspace=0.45)
+    fig.subplots_adjust(left=0.09, right=0.955, top=0.935, bottom=0.05,
+                        hspace=0.42, wspace=0.30)
     pdf.savefig(fig)
     plt.close(fig)
 
