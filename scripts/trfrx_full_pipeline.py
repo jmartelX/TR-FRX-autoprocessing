@@ -777,22 +777,29 @@ def svd_common_resolution(res_by_name: dict,
         return (max(res) if res else float("nan")), set(), {"gap": None}
     steps = [res[i + 1] - res[i] for i in range(len(res) - 1)]
 
-    cut_idx, typ = None, None
-    # candidate gap sits between res[i] and res[i+1]; need >=1 pack step (i >= 1)
-    for i in range(len(steps) - 1, 0, -1):
+    cut_idx, typ, skipped = None, None, None
+    # Scan from the PACK OUTWARDS: the first qualifying gap is the DEEPEST one, i.e.
+    # the one separating the tight main pack from every straggler. Cutting there
+    # keeps the common cutoff as sharp as the bulk of the series supports (cutting
+    # at the outermost gap instead would let one 9 A dataset set the cutoff for all).
+    # If a gap would drop more than max_frac, step further out to a gap that drops
+    # fewer, so a genuine two-regime spread still keeps everything.
+    for i in range(1, len(steps)):
         pack = steps[:i]                            # steps among the kept (better) pack only
         typical = (statistics.median(pack) or 1e-6) if pack else 1e-6
         if steps[i] >= abs_gap and steps[i] >= rel_gap * typical:
             n_dropped = len(res) - (i + 1)
             if n_dropped > max_frac * len(res):     # majority -> real spread, not an outlier
-                return max(res), set(), {
-                    "gap": round(steps[i], 3), "typical_step": round(typical, 3),
-                    "note": f"large resolution spread ({n_dropped}/{len(res)} beyond a "
-                            f"{steps[i]:.2f} A gap) — kept all at {max(res):.2f} A"}
+                skipped = (round(steps[i], 3), n_dropped)
+                continue                            # try a gap further out (drops fewer)
             cut_idx, typ = i + 1, typical
             break
     if cut_idx is None:
-        return max(res), set(), {"gap": None}
+        info = {"gap": None}
+        if skipped:
+            info["note"] = (f"large resolution spread (a {skipped[0]:.2f} A gap would "
+                            f"drop {skipped[1]}/{len(res)}) — kept all at {max(res):.2f} A")
+        return max(res), set(), info
     kept, dropped = items[:cut_idx], items[cut_idx:]
     common = kept[-1][1]
     info = {"gap": round(res[cut_idx] - res[cut_idx - 1], 3),
@@ -853,13 +860,16 @@ def plan_resolutions(mtz_files: list[Path], ref: Path,
         auto_dmin, auto_excluded, svd_info = honest.get(ref, float("nan")), set(), {}
 
     if forced is not None:
-        # Uniform: comparable maps are computed at `forced`. Genuine resolution
-        # outliers are STILL dropped from the SVD (just as in auto mode) — but only
-        # those that cannot reach the chosen cutoff, since a COARSER cutoff can
-        # legitimately re-include them. An excluded map keeps its own honest
-        # resolution (its individual map is for inspection, not the SVD).
-        excluded = {n for n in auto_excluded
-                    if name_eff.get(n, series_worst) > forced + 1e-4}
+        # Uniform: comparable maps are computed at `forced`. A dataset whose data
+        # does NOT reach `forced` cannot produce a valid map at that resolution —
+        # its high-resolution shells would simply be empty — so it is dropped from
+        # the SVD (empty shells would otherwise masquerade as a time-dependent
+        # component). This is checked for EVERY dataset, not only the gap-rule
+        # outliers: a sharper cutoff legitimately excludes more, a coarser one
+        # fewer. An excluded map keeps its own honest resolution (its individual
+        # map stays available for inspection, just not for comparison/SVD).
+        excluded = {m.name for m in mtz_files if m != ref
+                    and name_eff.get(m.name, series_worst) > forced + 1e-4}
         per_map = {m: (honest[m] if m.name in excluded else forced) for m in mtz_files}
         return {"per_map": per_map, "eff": eff, "nominal": nominal,
                 "svd_dmin": forced, "svd_excluded": excluded,
@@ -931,7 +941,10 @@ def print_honest_resolution_table(plan: dict, mtz_files: list[Path], ref: Path) 
     print("\nHonest resolution per MTZ  (nominal = header tip; honest = spherical "
           f"{int(COMPLETENESS_MIN*100)}%-complete):")
     print(f"  {'nominal':>8} {'honest':>8} {'map@':>8}   file")
-    for m in sorted(mtz_files, key=lambda x: per_map.get(x, 9e9)):
+    # Chronological order (by the MTZ trailing index) — the series reads as a time
+    # course, so radiation-damage decay is visible down the column.
+    for m in sorted(mtz_files, key=lambda x: (mtz_sort_index(x) if mtz_sort_index(x)
+                                              is not None else 10 ** 12, x.name)):
         tags = []
         if m == ref:
             tags.append("reference")
@@ -951,6 +964,43 @@ def print_honest_resolution_table(plan: dict, mtz_files: list[Path], ref: Path) 
         print(f"  {info['note']}")            # e.g. a genuine two-regime spread
     else:
         print("  No resolution outliers — every timepoint is in the SVD.")
+
+
+def print_resolution_plan_summary(plan: dict, mtz_files: list[Path], ref: Path) -> None:
+    """Final, unambiguous recap: for every dataset — the resolution its map is
+    computed at, and whether it enters the joint SVD (and if not, why).
+
+    Printed once the resolution mode is settled, so there is never any doubt about
+    which timepoint was used where and at which resolution.
+    """
+    per_map  = plan["per_map"]
+    eff      = plan["eff"]
+    excluded = plan["svd_excluded"]
+    svd_dmin = plan["svd_dmin"]
+    forced   = plan.get("forced")
+
+    print("\n  ── Resolution plan ─────────────────────────────────────────────────")
+    print(f"  {'timepoint':<28} {'honest':>8} {'map at':>8}   {'in SVD':<7} note")
+    n_in = 0
+    for m in sorted(mtz_files, key=lambda x: (mtz_sort_index(x) if mtz_sort_index(x)
+                                              is not None else 10 ** 12, x.name)):
+        nz = lambda v: f"{v:.3f}" if isinstance(v, (int, float)) and v == v else "  n/a"
+        if m == ref:
+            in_svd, note = "ref", "reference (subtracted from every map)"
+        elif m.name in excluded:
+            e = eff.get(m)
+            in_svd = "NO"
+            note = (f"data only to {e:.2f} A — cannot reach {svd_dmin:.2f} A"
+                    if isinstance(e, (int, float)) and e == e else "resolution outlier")
+        else:
+            in_svd, note = "yes", ""
+            n_in += 1
+        print(f"  {m.name[:28]:<28} {nz(eff.get(m)):>8} {nz(per_map.get(m)):>8}   "
+              f"{in_svd:<7} {note}")
+    mode = f"uniform {forced:.3f} A" if forced is not None else "auto (per-map)"
+    print(f"  mode: {mode}   |   SVD: {n_in} timepoint(s) at "
+          f"{svd_dmin:.3f} A" + (f", {len(excluded)} excluded" if excluded else "")
+          + "\n  ────────────────────────────────────────────────────────────────────")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2319,12 +2369,14 @@ def run_pipeline(args) -> int:
     args.res_plan     = plan                         # carried into the recap
     if plan["forced"] is not None:
         nexc = len(args.svd_excluded)
-        extra = (f"  ({nexc} resolution outlier(s) kept out of the SVD)"
+        extra = (f"  ({nexc} dataset(s) cannot reach it — kept out of the SVD)"
                  if nexc else "")
-        print(f"  -> Uniform {plan['forced']} A for all comparable maps.{extra}\n")
+        print(f"  -> Uniform {plan['forced']} A for all comparable maps.{extra}")
     else:
         print(f"  -> Each map at its own honest resolution; "
-              f"SVD common cutoff {args.svd_dmin:.3f} A.\n")
+              f"SVD common cutoff {args.svd_dmin:.3f} A.")
+    print_resolution_plan_summary(plan, mtz_files, ref)
+    print()
 
     merge_radius = args.merge_radius if args.merge_radius else max(MERGE_RADIUS_MIN, 0.0)
 
