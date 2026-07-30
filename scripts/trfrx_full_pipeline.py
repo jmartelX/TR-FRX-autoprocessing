@@ -78,10 +78,14 @@ EFF_RES_BINS     = 20     # resolution shells used for the completeness scan
 # read). A lone very-low-res timepoint would drag that cutoff down and blur every
 # component, so such resolution OUTLIERS are dropped from the SVD (their individual
 # maps are still made and still appear in the recap). Gap rule: cut before a jump
-# in the sorted honest resolutions that is BOTH >= SVD_OUTLIER_ABS_GAP A AND
-# >= SVD_OUTLIER_REL_GAP x the median inter-dataset step. A gradual RADDAM decay
-# (many small steps, no jump) trips nothing, so every timepoint stays in.
-SVD_OUTLIER_ABS_GAP  = 0.5   # A  — minimum absolute jump to call something an outlier
+# in the sorted honest resolutions that is BOTH >= SVD_OUTLIER_REL_GAP x the median
+# inter-dataset step AND above an absolute floor. That floor is SCALE-AWARE
+# (max(ABS_GAP_MIN, GAP_FRAC x the pack's worst resolution)) because what counts as
+# a big jump depends on the regime: 0.44 A after 3.0 A data is a cliff, the same
+# 0.44 A after 6 A data is nothing. A gradual RADDAM decay (many similar steps, no
+# jump) trips nothing, so every timepoint stays in.
+SVD_OUTLIER_ABS_GAP  = 0.15  # A  — hard floor: never call anything smaller a gap
+SVD_OUTLIER_GAP_FRAC = 0.08  # gap must also be >= this fraction of the pack's worst res
 SVD_OUTLIER_REL_GAP  = 4.0   # x typical step — jump must also be this many times typical
 SVD_OUTLIER_MAX_FRAC = 0.4   # never call a MAJORITY outliers: if a gap would drop more
                              # than this fraction it is a real resolution spread, not a
@@ -748,7 +752,8 @@ def prompt_resolution_choice(mtz_files: list[Path],
 def svd_common_resolution(res_by_name: dict,
                           abs_gap: float = SVD_OUTLIER_ABS_GAP,
                           rel_gap: float = SVD_OUTLIER_REL_GAP,
-                          max_frac: float = SVD_OUTLIER_MAX_FRAC) -> tuple[float, set, dict]:
+                          max_frac: float = SVD_OUTLIER_MAX_FRAC,
+                          gap_frac: float = SVD_OUTLIER_GAP_FRAC) -> tuple[float, set, dict]:
     """
     Common high-resolution cutoff for the JOINT SVD + the timepoints to exclude
     as resolution outliers.
@@ -787,7 +792,10 @@ def svd_common_resolution(res_by_name: dict,
     for i in range(1, len(steps)):
         pack = steps[:i]                            # steps among the kept (better) pack only
         typical = (statistics.median(pack) or 1e-6) if pack else 1e-6
-        if steps[i] >= abs_gap and steps[i] >= rel_gap * typical:
+        # Scale-aware absolute floor: judged against the pack's own worst resolution,
+        # so the same jump is a cliff at 3 A and noise at 8 A.
+        floor = max(abs_gap, gap_frac * res[i])
+        if steps[i] >= floor and steps[i] >= rel_gap * typical:
             n_dropped = len(res) - (i + 1)
             if n_dropped > max_frac * len(res):     # majority -> real spread, not an outlier
                 skipped = (round(steps[i], 3), n_dropped)
