@@ -2132,7 +2132,8 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
     """
     Submit the series to SLURM, reusing the TR-FRX_autoPROC_cbf.sh pattern:
     one job per source MTZ (diffmap + peak analysis), then a final SVD+recap
-    job chained with --dependency=afterok.
+    job chained with --dependency=afterany (so a failed timepoint still yields a
+    report from the maps that succeeded).
 
     The resolution plan decided by the submitting process is carried to the jobs:
     each per-map job gets its OWN honest resolution via --high-res (Feature 1), and
@@ -2180,8 +2181,12 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
         if args.dry_run:
             print(f"  [dry-run] sbatch {js}")
             continue
+        # -o keeps each job's output next to its script (otherwise SLURM drops
+        # slurm-<jobid>.out in whatever directory the run was launched from).
         out = subprocess.run(["sbatch", "-p", part, "-n", "1", "-c", "8",
-                              "--mem", "16000", str(js)],
+                              "--mem", "16000",
+                              "-o", str(jobs_dir / f"peaks_{mtz.stem}-%j.out"),
+                              str(js)],
                              text=True, stdout=subprocess.PIPE).stdout
         jid = out.strip().split()[-1] if out.strip() else None
         if jid:
@@ -2206,15 +2211,22 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
         f"{py} {script} {common}{svd_flags} --svd-only\n"
     )
     if args.dry_run:
-        print(f"  [dry-run] sbatch --dependency=afterok:<all> {final}")
+        print(f"  [dry-run] sbatch --dependency=afterany:<all> {final}")
         return 0
-    dep = f"--dependency=afterok:{':'.join(dep_ids)}" if dep_ids else ""
-    cmd = ["sbatch", "-p", part, "-n", "1", "-c", "8", "--mem", "24000"]
+    # afterANY, not afterok: if one timepoint fails, the SVD + recap + report must
+    # STILL be produced from the maps that did succeed. With afterok a single failed
+    # peak job leaves this job pending forever as DependencyNeverSatisfied and no
+    # report is ever written (same reasoning as the report job in TR-FRX_autoPROC.sh).
+    dep = f"--dependency=afterany:{':'.join(dep_ids)}" if dep_ids else ""
+    cmd = ["sbatch", "-p", part, "-n", "1", "-c", "8", "--mem", "24000",
+           "-o", str(jobs_dir / "svd_recap-%j.out")]
     if dep:
         cmd.append(dep)
     cmd.append(str(final))
     subprocess.run(cmd, check=False)
-    print(f"  submitted {final.name} (afterok chain). Jobs dir: {jobs_dir}")
+    print(f"  submitted {final.name} (afterany chain — runs even if some "
+          f"timepoints failed).")
+    print(f"  Job scripts + SLURM logs: {jobs_dir}")
     return 0
 
 
