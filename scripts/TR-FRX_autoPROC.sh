@@ -24,6 +24,18 @@
 #   # Read images from one place, write results to another:
 #   ./TR-FRX_autoPROC.sh <input_dir> <output_dir>
 #   ./TR-FRX_autoPROC.sh <input_dir> <output_dir> PfuGR_003_001_master.h5
+#
+#   # Reports ONLY — regenerate the statistics from chunks already processed,
+#   # without re-running autoPROC. Asks for an image limit (Enter = all):
+#   ./TR-FRX_autoPROC.sh --stats                   # autoproc_chunks in ./
+#   ./TR-FRX_autoPROC.sh --stats <dir>             # dir = output dir OR the
+#                                                  #   autoproc_chunks folder
+#   ./TR-FRX_autoPROC.sh --stats --max-image 2000  # skip the prompt
+#
+# --max-image N keeps only chunks that END at or before N (a chunk straddling N
+# is excluded, never truncated): N=2000 keeps ...1801-2000 and drops 2001-2200.
+# Limited reports are written with an _upto<N> suffix, so the full-series report
+# is never overwritten.
 
 set -euo pipefail
 
@@ -60,16 +72,62 @@ SLURM_MEM=24000
 IMAGES_DIR="$(pwd)"
 OUTPUT_DIR="$(pwd)"
 
-case "$#" in
-    0) : ;;                                       # tout par défaut (dossier courant)
-    1) IMAGE_TEMPLATE="$1" ;;                      # override du fichier uniquement
-    2) IMAGES_DIR="$1"; OUTPUT_DIR="$2" ;;         # lire dans $1, écrire dans $2
-    3) IMAGES_DIR="$1"; OUTPUT_DIR="$2"; IMAGE_TEMPLATE="$3" ;;
-    *)
-        echo "Usage : $0 [<input_dir> <output_dir>] [image_file]" >&2
-        exit 1
-        ;;
-esac
+# --- Options : --stats (rapports seuls) et --max-image N (limite d'images) ----
+STATS_ONLY=0
+MAX_IMAGE=""
+POSITIONAL=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --stats|--stats-only|--reports-only)
+            STATS_ONLY=1; shift ;;
+        --max-image|--max-images)
+            MAX_IMAGE="${2:-}"
+            if [ -z "$MAX_IMAGE" ]; then
+                echo "ERREUR : --max-image demande une valeur (ex : --max-image 2000)" >&2
+                exit 1
+            fi
+            shift 2 ;;
+        --max-image=*|--max-images=*)
+            MAX_IMAGE="${1#*=}"; shift ;;
+        -h|--help)
+            sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        -*)
+            echo "ERREUR : option inconnue '$1' (voir --help)" >&2
+            exit 1 ;;
+        *)
+            POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+if [ -n "$MAX_IMAGE" ] && ! printf '%s' "$MAX_IMAGE" | grep -Eq '^[0-9]+$'; then
+    echo "ERREUR : --max-image doit être un entier positif (reçu '$MAX_IMAGE')" >&2
+    exit 1
+fi
+
+if [ "$STATS_ONLY" -eq 1 ]; then
+    # Mode rapports : un seul argument optionnel = dossier de sortie OU le dossier
+    # autoproc_chunks lui-même. Aucune image n'est nécessaire.
+    case "$#" in
+        0) : ;;
+        1) OUTPUT_DIR="$1" ;;
+        *)
+            echo "Usage : $0 --stats [<dir>] [--max-image N]" >&2
+            exit 1 ;;
+    esac
+else
+    case "$#" in
+        0) : ;;                                       # tout par défaut (dossier courant)
+        1) IMAGE_TEMPLATE="$1" ;;                      # override du fichier uniquement
+        2) IMAGES_DIR="$1"; OUTPUT_DIR="$2" ;;         # lire dans $1, écrire dans $2
+        3) IMAGES_DIR="$1"; OUTPUT_DIR="$2"; IMAGE_TEMPLATE="$3" ;;
+        *)
+            echo "Usage : $0 [<input_dir> <output_dir>] [image_file]" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 # --- Chemins absolus (les nœuds de calcul SLURM doivent voir ces dossiers) ---
 if [ ! -d "$IMAGES_DIR" ]; then
@@ -82,22 +140,92 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Détection du mode d'après l'extension du fichier d'entrée ---
-case "$IMAGE_TEMPLATE" in
-    *.h5|*.H5|*.nxs|*.NXS) INPUT_MODE="HDF5" ;;
-    *.cbf|*.CBF)           INPUT_MODE="CBF" ;;
-    *)
-        echo "ERREUR : type d'entrée non reconnu pour '$IMAGE_TEMPLATE' (attendu .cbf ou .h5)" >&2
-        exit 1
-        ;;
-esac
-echo "Mode d'entrée : $INPUT_MODE ($IMAGE_TEMPLATE)"
-
-module load autoPROC
+# --- Détection du mode d'après l'extension du fichier d'entrée (traitement seul) ---
+if [ "$STATS_ONLY" -eq 0 ]; then
+    case "$IMAGE_TEMPLATE" in
+        *.h5|*.H5|*.nxs|*.NXS) INPUT_MODE="HDF5" ;;
+        *.cbf|*.CBF)           INPUT_MODE="CBF" ;;
+        *)
+            echo "ERREUR : type d'entrée non reconnu pour '$IMAGE_TEMPLATE' (attendu .cbf ou .h5)" >&2
+            exit 1
+            ;;
+    esac
+    echo "Mode d'entrée : $INPUT_MODE ($IMAGE_TEMPLATE)"
+    module load autoPROC
+fi
 
 # --- Tous les traitements seront créés dans un sous-dossier du dossier de sortie ---
-PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
-mkdir -p "$PROCESS_DIR"
+# En mode --stats, l'argument peut désigner soit le dossier de sortie, soit
+# directement le dossier autoproc_chunks (les deux fonctionnent).
+if [ "$STATS_ONLY" -eq 1 ] && [ "$(basename "$OUTPUT_DIR")" = "autoproc_chunks" ]; then
+    PROCESS_DIR="$OUTPUT_DIR"
+else
+    PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
+fi
+
+if [ "$STATS_ONLY" -eq 1 ]; then
+    # ---------------- Mode rapports seuls : pas d'autoPROC ----------------
+    if [ ! -d "$PROCESS_DIR" ]; then
+        echo "ERREUR : dossier de chunks introuvable : $PROCESS_DIR" >&2
+        echo "         (lancez le script depuis le dossier de sortie, ou passez-le" >&2
+        echo "          en argument : $0 --stats /chemin/vers/sortie)" >&2
+        exit 1
+    fi
+    # Chunks disponibles (autoPROC_<first>_<last>), triés par première image.
+    CHUNK_DIRS=$(find "$PROCESS_DIR" -maxdepth 1 -type d -name 'autoPROC_*_*' \
+                 -exec basename {} \; 2>/dev/null \
+                 | sed -E 's/^autoPROC_([0-9]+)_([0-9]+)$/\1 \2/' \
+                 | grep -E '^[0-9]+ [0-9]+$' | sort -n)
+    if [ -z "$CHUNK_DIRS" ]; then
+        echo "ERREUR : aucun chunk autoPROC_<first>_<last> dans $PROCESS_DIR" >&2
+        exit 1
+    fi
+    N_CHUNKS=$(printf '%s\n' "$CHUNK_DIRS" | wc -l | tr -d ' ')
+    LAST_AVAIL=$(printf '%s\n' "$CHUNK_DIRS" | awk '{print $2}' | sort -n | tail -1)
+    echo ""
+    echo "=========== Rapports seuls (pas de retraitement autoPROC) ==========="
+    echo "  Dossier des chunks : $PROCESS_DIR"
+    echo "  Chunks disponibles : $N_CHUNKS   (images 1 -> $LAST_AVAIL)"
+    printf '%s\n' "$CHUNK_DIRS" | awk '{printf "      images %s-%s\n", $1, $2}'
+    echo "===================================================================="
+    # Demande interactive de la limite (Enter = tout). Un chunk qui dépasse la
+    # limite est EXCLU (jamais tronqué) : limite 2000 -> ...1801-2000 conservé,
+    # 2001-2200 écarté.
+    if [ -z "$MAX_IMAGE" ]; then
+        while true; do
+            printf "Image maximale pour les statistiques [Entrée = tout (%s)] : " "$LAST_AVAIL"
+            if ! read -r ANSWER; then ANSWER=""; echo; fi
+            ANSWER="$(printf '%s' "$ANSWER" | tr -d '[:space:]')"
+            if [ -z "$ANSWER" ]; then
+                MAX_IMAGE=""            # aucune limite
+                break
+            fi
+            if printf '%s' "$ANSWER" | grep -Eq '^[0-9]+$'; then
+                KEPT=$(printf '%s\n' "$CHUNK_DIRS" \
+                       | awk -v lim="$ANSWER" '$2 <= lim' | wc -l | tr -d ' ')
+                if [ "$KEPT" -eq 0 ]; then
+                    FIRST_END=$(printf '%s\n' "$CHUNK_DIRS" | head -1 | awk '{print $2}')
+                    echo "  $ANSWER exclut tous les chunks (le premier finit à $FIRST_END). Réessayez."
+                    continue
+                fi
+                LAST_KEPT=$(printf '%s\n' "$CHUNK_DIRS" \
+                            | awk -v lim="$ANSWER" '$2 <= lim' | tail -1)
+                MAX_IMAGE="$ANSWER"
+                echo "  -> $KEPT chunk(s) conservés ; dernier = images ${LAST_KEPT% *}-${LAST_KEPT#* }"
+                break
+            fi
+            echo "  '$ANSWER' n'est pas un entier — tapez un nombre (ex : 2000) ou Entrée."
+        done
+    fi
+    if [ -n "$MAX_IMAGE" ]; then
+        echo "  Limite retenue : images <= $MAX_IMAGE  (fichiers suffixés _upto${MAX_IMAGE})"
+    else
+        echo "  Aucune limite : tous les chunks sont inclus."
+    fi
+    echo ""
+else
+    mkdir -p "$PROCESS_DIR"
+fi
 
 # --- Identifiants des jobs de traitement (pour le rapport final) ---
 CHUNK_JOBIDS=()
@@ -105,6 +233,8 @@ CHUNK_LABELS=()
 
 FIRST_OUTDIR=""
 FIRST_JOBID=""
+
+if [ "$STATS_ONLY" -eq 0 ]; then
 
 # --- Traitement du jeu de référence ---
 REF_JOB_BASENAME="${REF_FIRST_IMG}-${REF_LAST_IMG}_autoproc"
@@ -155,6 +285,8 @@ EOF
 
     i=$((j + 1))
 done
+
+fi   # fin du bloc de soumission autoPROC (ignoré en mode --stats)
 
 # =====================================================================
 # --- Générateur de rapports (écrit dans PROCESS_DIR, puis lancé) ------
@@ -918,7 +1050,8 @@ def _stats_tables(pdf, plt, rows, dataset, title):
         plt.close(fig)
 
 
-def write_pdf(path, dataset, title, rows, image_summary, wilson_method=""):
+def write_pdf(path, dataset, title, rows, image_summary, wilson_method="",
+              limit_note=""):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -941,9 +1074,10 @@ def write_pdf(path, dataset, title, rows, image_summary, wilson_method=""):
             "Generated: %s" % stamp,
             "Chunks (image ranges): %d" % len(image_summary),
             "Total images requested: %d" % sum(n for _, _, n in image_summary),
-            "",
-            "Image ranges:",
         ]
+        if limit_note:
+            lines += ["", limit_note]
+        lines += ["", "Image ranges:"]
         for name, rng, n in image_summary:
             lines.append("    %-24s images %-14s (%d)" % (name, rng, n))
         ax.text(0.0, 1.0, "\n".join(lines), va="top", ha="left",
@@ -978,6 +1112,13 @@ def main():
     parser.add_argument("--dataset", default=None,
                         help="Dataset name shown at the top of the reports "
                              "(default: parent folder of autoproc_chunks).")
+    parser.add_argument("--max-image", type=int, default=None, metavar="N",
+                        help="Stop the statistics at image N: keep only chunks "
+                             "that END at or before N (a chunk straddling N is "
+                             "excluded, never truncated). E.g. --max-image 2000 "
+                             "keeps ...1801-2000 and drops 2001-2200. Output "
+                             "files get an _upto<N> suffix so the full report "
+                             "is never overwritten.")
     args = parser.parse_args()
 
     process_dir = os.path.abspath(args.process_dir)
@@ -993,12 +1134,41 @@ def main():
             chunks.append((name, int(m.group(1)), int(m.group(2))))
     chunks.sort(key=lambda c: c[1])
 
+    # --max-image: keep whole chunks only. A chunk is kept when its LAST image is
+    # <= N, so the cut lands on a chunk boundary and no partial window is ever
+    # plotted (limit 2000 keeps 1801-2000, drops 2001-2200).
+    limit_note = ""
+    suffix = ""
+    dropped = []
+    if args.max_image is not None:
+        keep = [c for c in chunks if c[2] <= args.max_image]
+        dropped = [c for c in chunks if c[2] > args.max_image]
+        if not keep:
+            sys.stderr.write(
+                "ERROR: --max-image %d excludes every chunk (the first one ends "
+                "at %s).\n" % (args.max_image,
+                               chunks[0][2] if chunks else "n/a"))
+            return 1
+        chunks = keep
+        suffix = "_upto%d" % args.max_image
+        limit_note = ("Limited to images <= %d  (last chunk kept: %s; %d chunk(s) "
+                      "excluded)" % (args.max_image, chunks[-1][0], len(dropped)))
+        print("Limit --max-image %d: keeping %d chunk(s) up to image %d; "
+              "dropping %d." % (args.max_image, len(chunks), chunks[-1][2],
+                                len(dropped)))
+        for nm, a, b in dropped:
+            print("    excluded: %s (images %d-%d)" % (nm, a, b))
+
     diagnostics = ["TR-FRX damage report - %s"
                    % datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                    "Dataset: %s" % dataset,
                    "Process dir: %s" % process_dir,
                    "Chunks found: %d" % len(chunks),
+                   "Image limit: %s" % (limit_note or "none (all chunks)"),
                    "Per-chunk sources:"]
+    for nm, a, b in dropped:
+        diagnostics.append("    EXCLUDED by --max-image: %s (images %d-%d)"
+                           % (nm, a, b))
 
     best_by_chunk = {}
     image_summary = []
@@ -1049,25 +1219,37 @@ def main():
     for route, pretty in [("truncate", "Classical autoPROC (TRUNCATE)"),
                           ("staraniso", "STARANISO")]:
         rows = rows_for(route)
-        write_csv(os.path.join(out_dir, "%s_statistics.csv" % route), rows)
-        write_pdf(os.path.join(out_dir, "%s_report.pdf" % route),
-                  dataset, pretty, rows, image_summary, wmethods[route])
+        write_csv(os.path.join(out_dir, "%s_statistics%s.csv" % (route, suffix)),
+                  rows)
+        write_pdf(os.path.join(out_dir, "%s_report%s.pdf" % (route, suffix)),
+                  dataset, pretty, rows, image_summary, wmethods[route],
+                  limit_note)
 
-    with open(os.path.join(out_dir, "parsing_diagnostics.txt"), "w") as fh:
+    with open(os.path.join(out_dir,
+                           "parsing_diagnostics%s.txt" % suffix), "w") as fh:
         fh.write("\n".join(diagnostics) + "\n")
 
     print("Reports written to %s" % out_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
 PYEOF
+
+# Limite d'images éventuelle, transmise au générateur de rapports.
+REPORT_ARGS=""
+if [ -n "$MAX_IMAGE" ]; then
+    REPORT_ARGS="--max-image $MAX_IMAGE"
+fi
 
 REPORT_JOB_SCRIPT="${PROCESS_DIR}/generate_reports.sh"
 cat > "$REPORT_JOB_SCRIPT" <<EOF
 #!/bin/bash
 set -euo pipefail
-module load autoPROC
+# autoPROC n'est PAS nécessaire pour les rapports (python + matplotlib + gemmi
+# suffisent) : on charge le module s'il existe, sans faire échouer le script.
+if type module >/dev/null 2>&1; then module load autoPROC 2>/dev/null || true; fi
 cd "$PROCESS_DIR"
 # Prefer the trfrx venv (created by setup_env.sh): it carries matplotlib and
 # gemmi, needed for the PDF plots and the MTZ-derived Wilson B. Fall back to any
@@ -1079,8 +1261,21 @@ elif command -v python3 >/dev/null 2>&1; then
 else
     PY=python
 fi
-"\$PY" "$PROCESS_DIR/trfrx_damage_report.py" --process-dir "$PROCESS_DIR"
+"\$PY" "$PROCESS_DIR/trfrx_damage_report.py" --process-dir "$PROCESS_DIR" $REPORT_ARGS
 EOF
+chmod +x "$REPORT_JOB_SCRIPT"
+
+if [ "$STATS_ONLY" -eq 1 ]; then
+    # Rapports seuls : rien à attendre, on génère tout de suite (quelques secondes).
+    echo "Génération des rapports..."
+    bash "$REPORT_JOB_SCRIPT"
+    echo ""
+    echo "Rapports dans : $PROCESS_DIR/reports"
+    if [ -n "$MAX_IMAGE" ]; then
+        echo "  (fichiers suffixés _upto${MAX_IMAGE} ; le rapport complet est conservé)"
+    fi
+    exit 0
+fi
 
 # NB : afterany (et non afterok) => le rapport est TOUJOURS généré une fois que
 # tous les chunks sont terminés, même si certains ont échoué (on aura alors
@@ -1105,3 +1300,6 @@ echo "Suivi : squeue -j $(IFS=,; echo "${CHUNK_JOBIDS[*]},$REPORT_JOBID")"
 echo ""
 echo "Traitements soumis. Résultats dans : $PROCESS_DIR"
 echo "Rapports finaux (générés après traitement) dans : $PROCESS_DIR/reports"
+echo ""
+echo "Astuce : pour refaire seulement les statistiques (sans retraiter), lancez"
+echo "         $0 --stats \"$OUTPUT_DIR\""
