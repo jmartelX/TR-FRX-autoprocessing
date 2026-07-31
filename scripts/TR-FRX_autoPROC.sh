@@ -90,7 +90,10 @@ while [ "$#" -gt 0 ]; do
         --max-image=*|--max-images=*)
             MAX_IMAGE="${1#*=}"; shift ;;
         -h|--help)
-            sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            # En-tête du script jusqu'à la première ligne non commentée
+            # (pas de numéro de ligne codé en dur : reste juste si l'aide grossit).
+            awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' \
+                "${BASH_SOURCE[0]}"
             exit 0 ;;
         -*)
             echo "ERREUR : option inconnue '$1' (voir --help)" >&2
@@ -169,8 +172,10 @@ fi
 # un dossier de timepoint...), soit son dossier parent. Détection par le contenu,
 # pas par le nom, pour accepter toutes les arborescences.
 PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
+
 if [ "$STATS_ONLY" -eq 1 ]; then
-    # Deux arborescences sont acceptées, le générateur cherche sur un niveau :
+    # ---------------- Mode rapports seuls : pas d'autoPROC ----------------
+    # Deux arborescences sont acceptées (détection par le contenu, pas par le nom) :
     #   plate    : <dir>/autoPROC_1_150           (TR-FRX_autoPROC.sh)
     #   imbriquée: <dir>/1_150/autoPROC_1_150     (copie de trfrx_full_pipeline)
     if ls -d "$OUTPUT_DIR"/autoPROC_*_* >/dev/null 2>&1; then
@@ -180,10 +185,6 @@ if [ "$STATS_ONLY" -eq 1 ]; then
     elif ls -d "$OUTPUT_DIR"/*/autoPROC_*_* >/dev/null 2>&1; then
         PROCESS_DIR="$OUTPUT_DIR"                        # arborescence imbriquée
     fi
-fi
-
-if [ "$STATS_ONLY" -eq 1 ]; then
-    # ---------------- Mode rapports seuls : pas d'autoPROC ----------------
     if [ ! -d "$PROCESS_DIR" ]; then
         echo "ERREUR : dossier de chunks introuvable : $PROCESS_DIR" >&2
         echo "         (lancez le script depuis le dossier de sortie, ou passez-le" >&2
@@ -203,11 +204,12 @@ if [ "$STATS_ONLY" -eq 1 ]; then
         exit 1
     fi
     N_CHUNKS=$(printf '%s\n' "$CHUNK_DIRS" | wc -l | tr -d ' ')
+    FIRST_AVAIL=$(printf '%s\n' "$CHUNK_DIRS" | awk '{print $1}' | sort -n | head -1)
     LAST_AVAIL=$(printf '%s\n' "$CHUNK_DIRS" | awk '{print $2}' | sort -n | tail -1)
     echo ""
     echo "=========== Rapports seuls (pas de retraitement autoPROC) ==========="
     echo "  Dossier des chunks : $PROCESS_DIR"
-    echo "  Chunks disponibles : $N_CHUNKS   (images 1 -> $LAST_AVAIL)"
+    echo "  Chunks disponibles : $N_CHUNKS   (images $FIRST_AVAIL -> $LAST_AVAIL)"
     printf '%s\n' "$CHUNK_DIRS" | awk '{printf "      images %s-%s\n", $1, $2}'
     echo "===================================================================="
     # Demande interactive de la limite (Enter = tout). Un chunk qui dépasse la
@@ -889,29 +891,6 @@ def wilson_b_by_chunk(rows_meta, diagnostics, route):
 # --------------------------------------------------------------------------
 # PDF report.
 # --------------------------------------------------------------------------
-def _series(rows, col):
-    """(x, y) of mean image number vs numeric metric, dropping N/A."""
-    xs, ys = [], []
-    for r in rows:
-        d = dict(r)
-        y = to_float(d.get(col))
-        first = to_float(d.get("image_first"))
-        last = to_float(d.get("image_last"))
-        if y is None or first is None or last is None:
-            continue
-        xs.append(0.5 * (first + last))
-        ys.append(y)
-    return xs, ys
-
-
-def _pct_change_series(rows, col):
-    xs, ys = _series(rows, col)
-    if not ys or ys[0] == 0:
-        return [], []
-    base = ys[0]
-    return xs, [100.0 * (y - base) / base for y in ys]
-
-
 # Colour palette (Tol "bright", teal as the 3rd colour). Applied per panel by
 # series order; dashes are used ONLY where two lines would coincide (cell edge b
 # on a, images used on requested). Everything else is a solid continuous step.
