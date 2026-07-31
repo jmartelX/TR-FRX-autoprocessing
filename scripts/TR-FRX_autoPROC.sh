@@ -130,12 +130,21 @@ else
 fi
 
 # --- Chemins absolus (les nœuds de calcul SLURM doivent voir ces dossiers) ---
-if [ ! -d "$IMAGES_DIR" ]; then
-    echo "ERREUR : dossier d'entrée introuvable : $IMAGES_DIR" >&2
-    exit 1
+# En mode --stats aucune image n'est lue : on ne vérifie donc que le dossier de
+# sortie (qui doit déjà exister, on ne le crée pas pour éviter les fautes de frappe).
+if [ "$STATS_ONLY" -eq 0 ]; then
+    if [ ! -d "$IMAGES_DIR" ]; then
+        echo "ERREUR : dossier d'entrée introuvable : $IMAGES_DIR" >&2
+        exit 1
+    fi
+    IMAGES_DIR="$(cd "$IMAGES_DIR" && pwd)"
+    mkdir -p "$OUTPUT_DIR"
+else
+    if [ ! -d "$OUTPUT_DIR" ]; then
+        echo "ERREUR : dossier introuvable : $OUTPUT_DIR" >&2
+        exit 1
+    fi
 fi
-IMAGES_DIR="$(cd "$IMAGES_DIR" && pwd)"
-mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -155,12 +164,20 @@ if [ "$STATS_ONLY" -eq 0 ]; then
 fi
 
 # --- Tous les traitements seront créés dans un sous-dossier du dossier de sortie ---
-# En mode --stats, l'argument peut désigner soit le dossier de sortie, soit
-# directement le dossier autoproc_chunks (les deux fonctionnent).
-if [ "$STATS_ONLY" -eq 1 ] && [ "$(basename "$OUTPUT_DIR")" = "autoproc_chunks" ]; then
-    PROCESS_DIR="$OUTPUT_DIR"
-else
-    PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
+# En mode --stats, l'argument peut désigner soit un dossier CONTENANT les chunks
+# autoPROC_<first>_<last> (quel que soit son nom : autoproc_chunks, autoproc_copy,
+# un dossier de timepoint...), soit son dossier parent. Détection par le contenu,
+# pas par le nom, pour accepter toutes les arborescences.
+PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
+if [ "$STATS_ONLY" -eq 1 ]; then
+    if ls -d "$OUTPUT_DIR"/autoPROC_*_* >/dev/null 2>&1; then
+        PROCESS_DIR="$OUTPUT_DIR"                    # les chunks sont ici même
+    elif [ ! -d "$PROCESS_DIR" ]; then
+        # dernier recours : un unique sous-dossier contenant des chunks
+        CAND=$(find "$OUTPUT_DIR" -maxdepth 2 -type d -name 'autoPROC_*_*' 2>/dev/null \
+               | head -1)
+        if [ -n "$CAND" ]; then PROCESS_DIR="$(dirname "$CAND")"; fi
+    fi
 fi
 
 if [ "$STATS_ONLY" -eq 1 ]; then
