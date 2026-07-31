@@ -170,13 +170,15 @@ fi
 # pas par le nom, pour accepter toutes les arborescences.
 PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
 if [ "$STATS_ONLY" -eq 1 ]; then
+    # Deux arborescences sont acceptées, le générateur cherche sur un niveau :
+    #   plate    : <dir>/autoPROC_1_150           (TR-FRX_autoPROC.sh)
+    #   imbriquée: <dir>/1_150/autoPROC_1_150     (copie de trfrx_full_pipeline)
     if ls -d "$OUTPUT_DIR"/autoPROC_*_* >/dev/null 2>&1; then
-        PROCESS_DIR="$OUTPUT_DIR"                    # les chunks sont ici même
-    elif [ ! -d "$PROCESS_DIR" ]; then
-        # dernier recours : un unique sous-dossier contenant des chunks
-        CAND=$(find "$OUTPUT_DIR" -maxdepth 2 -type d -name 'autoPROC_*_*' 2>/dev/null \
-               | head -1)
-        if [ -n "$CAND" ]; then PROCESS_DIR="$(dirname "$CAND")"; fi
+        PROCESS_DIR="$OUTPUT_DIR"                        # chunks directement ici
+    elif [ -d "$PROCESS_DIR" ]; then
+        :                                                # <dir>/autoproc_chunks
+    elif ls -d "$OUTPUT_DIR"/*/autoPROC_*_* >/dev/null 2>&1; then
+        PROCESS_DIR="$OUTPUT_DIR"                        # arborescence imbriquée
     fi
 fi
 
@@ -189,10 +191,13 @@ if [ "$STATS_ONLY" -eq 1 ]; then
         exit 1
     fi
     # Chunks disponibles (autoPROC_<first>_<last>), triés par première image.
-    CHUNK_DIRS=$(find "$PROCESS_DIR" -maxdepth 1 -type d -name 'autoPROC_*_*' \
+    # maxdepth 2 : couvre l'arborescence plate ET l'arborescence imbriquée
+    # (<dir>/1_150/autoPROC_1_150) produite par trfrx_full_pipeline.
+    # -L : suit les liens symboliques (dossiers de chunks parfois liés).
+    CHUNK_DIRS=$(find -L "$PROCESS_DIR" -maxdepth 2 -type d -name 'autoPROC_*_*' \
                  -exec basename {} \; 2>/dev/null \
                  | sed -E 's/^autoPROC_([0-9]+)_([0-9]+)$/\1 \2/' \
-                 | grep -E '^[0-9]+ [0-9]+$' | sort -n)
+                 | grep -E '^[0-9]+ [0-9]+$' | sort -n -u)
     if [ -z "$CHUNK_DIRS" ]; then
         echo "ERREUR : aucun chunk autoPROC_<first>_<last> dans $PROCESS_DIR" >&2
         exit 1
@@ -629,6 +634,30 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
         if prio > e["mtz_rank"]:
             e["mtz"], e["mtz_rank"] = fpath, prio
 
+    def handle_text(fname, rel, text, path_hint=""):
+        """Scrape one text file (loose on disk or read from summary.tar.gz)."""
+        low = fname.lower()
+        route_of_file = "staraniso" if "staraniso" in low else "truncate"
+        cell = scrape_cell(text)
+        wilson = (scrape_staraniso_wilson_b(text) if route_of_file == "staraniso"
+                  else scrape_wilson_b(text))
+        images = scrape_images_used(text)
+        images = images if images[0] is not None else None
+        # Unit cell / images used are route-agnostic — record for both so the
+        # STARANISO route is not left blank when only a truncate log has them.
+        for r in ("truncate", "staraniso"):
+            consider_extra(r, fname, rel, cell,
+                           wilson if r == route_of_file else None, images)
+        if low.endswith(".table1"):
+            consider(route_of_file, parse_table1(text), fname, rel)
+        elif low.endswith(".log") or low.endswith(".lp"):
+            for block in find_summary_blocks(text):
+                route = ("staraniso" if is_staraniso(path_hint or fname,
+                                                     block["title"])
+                         else "truncate")
+                consider(route, block["metrics"], fname, rel)
+
+    tarballs = []
     for root, _dirs, files in os.walk(chunk_dir):
         for fname in files:
             low = fname.lower()
@@ -638,6 +667,9 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
                 route = "staraniso" if "staraniso" in low else "truncate"
                 consider_mtz(route, fname, fpath)
                 continue
+            if low.endswith(".tar.gz") or low.endswith(".tgz"):
+                tarballs.append(fpath)
+                continue
             if not (low.endswith(".table1") or low.endswith(".log")
                     or low.endswith(".lp")):
                 continue
@@ -646,24 +678,48 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
                     text = fh.read(2_000_000)     # cap: XDS .LP can be huge
             except (IOError, OSError):
                 continue
-            route_of_file = "staraniso" if "staraniso" in low else "truncate"
-            cell = scrape_cell(text)
-            wilson = (scrape_staraniso_wilson_b(text) if route_of_file == "staraniso"
-                      else scrape_wilson_b(text))
-            images = scrape_images_used(text)
-            images = images if images[0] is not None else None
-            # Unit cell / images used are route-agnostic — record for both so the
-            # STARANISO route is not left blank when only a truncate log has them.
-            for r in ("truncate", "staraniso"):
-                consider_extra(r, fname, rel, cell,
-                               wilson if r == route_of_file else None, images)
-            if low.endswith(".table1"):
-                consider(route_of_file, parse_table1(text), fname, rel)
-            elif low.endswith(".log"):
-                for block in find_summary_blocks(text):
-                    route = ("staraniso" if is_staraniso(fpath, block["title"])
-                             else "truncate")
-                    consider(route, block["metrics"], fname, rel)
+            handle_text(fname, rel, text, fpath)
+
+    # Fallback for pipeline-copied trees (trfrx_full_pipeline copies only a few
+    # files per chunk): the loose *.table1 / aimless logs are absent, but
+    # summary.tar.gz still carries them. Only opened when a route has no metrics
+    # yet, and only its small text members are read.
+    if tarballs and (best["truncate"] is None or best["staraniso"] is None):
+        import tarfile
+        for tpath in tarballs:
+            try:
+                tf = tarfile.open(tpath, "r:*")
+            except (tarfile.TarError, IOError, OSError) as exc:
+                diagnostics.append("    could not open %s (%s)"
+                                   % (os.path.basename(tpath), exc))
+                continue
+            try:
+                for member in tf:
+                    if not member.isfile():
+                        continue
+                    mlow = member.name.lower()
+                    if not (mlow.endswith(".table1") or mlow.endswith(".log")):
+                        continue
+                    if member.size > 2_000_000:
+                        continue
+                    fh = tf.extractfile(member)
+                    if fh is None:
+                        continue
+                    try:
+                        text = fh.read().decode("utf-8", "replace")
+                    finally:
+                        fh.close()
+                    base = os.path.basename(member.name)
+                    # No early exit: every candidate must be seen so the usual
+                    # source_priority ranking picks the SAME file the flat layout
+                    # would use (truncate-unique.table1 beats aimless_alldata-*).
+                    handle_text(base, "%s:%s" % (os.path.basename(tpath), base),
+                                text, member.name)
+            except (tarfile.TarError, IOError, OSError, EOFError) as exc:
+                diagnostics.append("    error reading %s (%s)"
+                                   % (os.path.basename(tpath), exc))
+            finally:
+                tf.close()
 
     result = {}
     for route in ("truncate", "staraniso"):
@@ -969,7 +1025,7 @@ def _damage_plots(pdf, plt, rows, dataset, title, wilson_method=""):
         if not drew:
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
                     fontsize=8, color=_MUT, transform=ax.transAxes)
-        if sum(1 for s in specs if s[0]) > 1:
+        if drew and sum(1 for s in specs if s[0]) > 1:
             ax.legend(fontsize=7.5, frameon=False, loc="best", handlelength=2.0)
 
     fig.subplots_adjust(left=0.09, right=0.955, top=0.935, bottom=0.05,
@@ -1143,13 +1199,36 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     dataset = detect_dataset(process_dir, args.dataset)
 
-    chunks = []
-    for name in sorted(os.listdir(process_dir)):
-        m = CHUNK_RE.match(name)
-        full = os.path.join(process_dir, name)
-        if m and os.path.isdir(full):
-            chunks.append((name, int(m.group(1)), int(m.group(2))))
-    chunks.sort(key=lambda c: c[1])
+    def _scan_chunks(root):
+        """(name, first, last, path) for autoPROC_<first>_<last> dirs in *root*."""
+        found = []
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            return found
+        for name in names:
+            full = os.path.join(root, name)
+            m = CHUNK_RE.match(name)
+            if m and os.path.isdir(full):
+                found.append((name, int(m.group(1)), int(m.group(2)), full))
+        return found
+
+    # Two layouts are supported:
+    #   flat   : <process_dir>/autoPROC_1_150            (TR-FRX_autoPROC.sh)
+    #   nested : <process_dir>/1_150/autoPROC_1_150      (trfrx_full_pipeline copy)
+    entries = _scan_chunks(process_dir)
+    if not entries:
+        for sub in sorted(os.listdir(process_dir)):
+            subdir = os.path.join(process_dir, sub)
+            if os.path.isdir(subdir):
+                entries.extend(_scan_chunks(subdir))
+    entries.sort(key=lambda c: c[1])
+    chunks = [(n, a, b) for n, a, b, _p in entries]
+    chunk_path = dict((n, p) for n, _a, _b, p in entries)
+    if not chunks:
+        sys.stderr.write("ERROR: no autoPROC_<first>_<last> chunk directory found "
+                         "in %s (searched one level deep).\n" % process_dir)
+        return 1
 
     # --max-image: keep whole chunks only. A chunk is kept when its LAST image is
     # <= N, so the cut lands on a chunk boundary and no partial window is ever
@@ -1192,7 +1271,7 @@ def main():
     meta = {"truncate": [], "staraniso": []}
     for name, first, last in chunks:
         image_summary.append((name, "%d-%d" % (first, last), last - first + 1))
-        best = collect_chunk_blocks(os.path.join(process_dir, name), diagnostics)
+        best = collect_chunk_blocks(chunk_path[name], diagnostics)
         best_by_chunk[name] = (first, last, best)
         mid = 0.5 * (first + last)
         for route in ("truncate", "staraniso"):
@@ -1283,6 +1362,29 @@ EOF
 chmod +x "$REPORT_JOB_SCRIPT"
 
 if [ "$STATS_ONLY" -eq 1 ]; then
+    # Sans limite, les fichiers portent les noms par défaut : on prévient avant
+    # d'écraser des rapports existants (p. ex. ceux copiés par trfrx_full_pipeline).
+    if [ -z "$MAX_IMAGE" ]; then
+        # NB : pas de `ls` ici — un glob sans correspondance renverrait un code
+        # non nul et `set -e`/`pipefail` tuerait le script silencieusement.
+        EXISTING=0
+        for _f in "$PROCESS_DIR"/reports/*_report.pdf \
+                  "$PROCESS_DIR"/reports/*_statistics.csv; do
+            if [ -e "$_f" ]; then EXISTING=$((EXISTING + 1)); fi
+        done
+        if [ "$EXISTING" -gt 0 ]; then
+            echo "ATTENTION : $EXISTING fichier(s) de rapport existent déjà dans"
+            echo "            $PROCESS_DIR/reports et vont être ÉCRASÉS."
+            echo "            (une limite --max-image ajoute un suffixe _upto<N> et"
+            echo "             conserve les fichiers existants)"
+            printf "Continuer et écraser ? [o/N] : "
+            if ! read -r CONFIRM; then CONFIRM=""; echo; fi
+            case "$(printf '%s' "$CONFIRM" | tr '[:upper:]' '[:lower:]')" in
+                o|oui|y|yes) : ;;
+                *) echo "Abandon (aucun fichier modifié)."; exit 0 ;;
+            esac
+        fi
+    fi
     # Rapports seuls : rien à attendre, on génère tout de suite (quelques secondes).
     echo "Génération des rapports..."
     bash "$REPORT_JOB_SCRIPT"
