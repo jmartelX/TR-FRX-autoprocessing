@@ -927,90 +927,125 @@ def _step_xy(rows, col, pct=False):
     return xs, ys
 
 
-def _damage_plots(pdf, plt, rows, dataset, title, wilson_method=""):
-    """Radiation-damage report page: one continuous step line per metric, drawn
-    flat across each image window (see _step_xy). Colour is by series order from
-    _PALETTE; dashes appear only to separate coincident lines. Panels: high-res
-    limit, R-factors, I/sigma, CC(1/2), Wilson B, cell edges & volume, images."""
-    fig = plt.figure(figsize=(8.4, 11.3))
-    fig.patch.set_facecolor("white")
-    fig.text(0.07, 0.972, dataset, fontsize=17, fontweight="bold", color=_INK)
-    fig.text(0.07, 0.9555,
-             "%s route  ·  radiation-damage indicators vs image number" % title,
-             fontsize=9, color=_MUT)
+# Damage-report panels. Each: (title, y-label, invert-y, series, slug).
+# series item: (legend, column, pct, colour_idx, dash). Colour is by series order
+# from _PALETTE; dashes only separate coincident lines (a=b, requested=used).
+# The slug is the filename stem for the per-panel publication figures.
+_DAMAGE_PANELS = [
+    ("High-resolution limit", "d_high (Å)", True,
+        [("", "resolution_high", False, 0, _SOLID)], "resolution"),
+    ("R-factors", "R", False,
+        [("Rmerge", "Rmerge", False, 0, _SOLID),
+         ("Rmeas", "Rmeas", False, 1, _SOLID),
+         ("Rpim", "Rpim", False, 2, _SOLID)], "R-factors"),
+    ("Mean I / σ(I)", "I/σ", False,
+        [("overall", "Mean_I_over_sigma", False, 0, _SOLID),
+         ("outer", "Mean_I_over_sigma_outer", False, 1, _SOLID)], "I-over-sigma"),
+    ("CC½", "CC½", False,
+        [("overall", "CC_half", False, 0, _SOLID),
+         ("outer", "CC_half_outer", False, 1, _SOLID)], "CC-half"),
+    ("Wilson B-factor", "B (Å²)", False,
+        [("", "Wilson_B", False, 0, _SOLID)], "Wilson-B"),
+    # Unit-cell edges as TRUE Ångström lengths (not % change). a = b by symmetry,
+    # so b is dashed to stay visible where it coincides with a.
+    ("Unit-cell edges", "edge (Å)", False,
+        [("a", "cell_a", False, 0, _SOLID),
+         ("b", "cell_b", False, 1, _DASH),
+         ("c", "cell_c", False, 2, _SOLID)], "cell-edges"),
+    ("Images per chunk", "N images", False,
+        [("requested", "n_images", False, 0, _SOLID),
+         ("used", "images_used", False, 1, _DASH)], "images"),
+]
 
-    # tight x-range straight from the actual windows
+
+def _x_range(rows):
+    """(x0, x1, xpad): tight image-number range straight from the windows."""
     xf = [to_float(dict(r).get("image_first")) for r in rows]
     xl = [to_float(dict(r).get("image_last")) for r in rows]
     xf = [v for v in xf if v is not None]
     xl = [v for v in xl if v is not None]
     x0 = min(xf) if xf else 0.0
     x1 = max(xl) if xl else 1.0
-    xpad = 0.012 * ((x1 - x0) or 1.0)
+    return x0, x1, 0.012 * ((x1 - x0) or 1.0)
 
-    C, SOL, DASH = _PALETTE, _SOLID, _DASH
-    # (panel title, y-label, invert-y, [(legend, column, pct, colour_idx, dash)])
-    panels = [
-        ("High-resolution limit", "d_high (Å)", True,
-            [("", "resolution_high", False, 0, SOL)]),
-        ("R-factors", "R", False,
-            [("Rmerge", "Rmerge", False, 0, SOL),
-             ("Rmeas", "Rmeas", False, 1, SOL),
-             ("Rpim", "Rpim", False, 2, SOL)]),
-        ("Mean I / σ(I)", "I/σ", False,
-            [("overall", "Mean_I_over_sigma", False, 0, SOL),
-             ("outer", "Mean_I_over_sigma_outer", False, 1, SOL)]),
-        ("CC½", "CC½", False,
-            [("overall", "CC_half", False, 0, SOL),
-             ("outer", "CC_half_outer", False, 1, SOL)]),
-        ("Wilson B-factor", "B (Å²)", False,
-            [("", "Wilson_B", False, 0, SOL)]),
-        ("Unit-cell edges", "Δ edge (%)", False,
-            [("a", "cell_a", True, 0, SOL),
-             ("b", "cell_b", True, 1, DASH),
-             ("c", "cell_c", True, 2, SOL)]),
-        ("Unit-cell volume", "ΔV (%)", False,
-            [("", "cell_volume", True, 0, SOL)]),
-        ("Images per chunk", "N images", False,
-            [("requested", "n_images", False, 0, SOL),
-             ("used", "images_used", False, 1, DASH)]),
-    ]
 
-    for idx, (ptitle, ylab, invert, specs) in enumerate(panels, 1):
-        ax = fig.add_subplot(4, 2, idx)
-        drew = False
-        for lab, col, pct, ci, dash in specs:
-            xs, ys = _step_xy(rows, col, pct)
-            if not xs:
-                continue
-            ax.plot(xs, ys, color=C[ci % len(C)], lw=1.8, ls=dash,
-                    label=(lab or None), solid_capstyle="round")
-            drew = True
-        for sp in ("top", "right"):
-            ax.spines[sp].set_visible(False)
-        for sp in ("left", "bottom"):
-            ax.spines[sp].set_color(_SPINE)
-            ax.spines[sp].set_linewidth(0.9)
-        ax.grid(axis="y", color=_GRID, lw=0.9)
-        ax.set_axisbelow(True)
-        ax.tick_params(length=0, labelsize=7.5, colors=_MUT)
-        ax.set_title(ptitle, loc="left", fontsize=10.5, fontweight="bold",
-                     color=_INK, pad=7)
-        ax.set_ylabel(ylab, fontsize=8, color=_MUT)
-        ax.set_xlabel("image number", fontsize=8, color=_MUT)
-        ax.set_xlim(x0 - xpad, x1 + xpad)
-        if invert and drew:
-            ax.invert_yaxis()
-        if not drew:
-            ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    fontsize=8, color=_MUT, transform=ax.transAxes)
-        if drew and sum(1 for s in specs if s[0]) > 1:
-            ax.legend(fontsize=7.5, frameon=False, loc="best", handlelength=2.0)
+def _draw_panel(ax, panel, rows, xr):
+    """Draw one damage panel (step lines + shared styling) onto *ax*.
 
+    Shared by the combined PDF page and the standalone publication figures, so
+    the two never drift apart. Returns True if any series was drawn."""
+    ptitle, ylab, invert, specs, _slug = panel
+    x0, x1, xpad = xr
+    C = _PALETTE
+    drew = False
+    for lab, col, pct, ci, dash in specs:
+        xs, ys = _step_xy(rows, col, pct)
+        if not xs:
+            continue
+        ax.plot(xs, ys, color=C[ci % len(C)], lw=1.8, ls=dash,
+                label=(lab or None), solid_capstyle="round")
+        drew = True
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("left", "bottom"):
+        ax.spines[sp].set_color(_SPINE)
+        ax.spines[sp].set_linewidth(0.9)
+    ax.grid(axis="y", color=_GRID, lw=0.9)
+    ax.set_axisbelow(True)
+    ax.tick_params(length=0, labelsize=7.5, colors=_MUT)
+    ax.set_title(ptitle, loc="left", fontsize=10.5, fontweight="bold",
+                 color=_INK, pad=7)
+    ax.set_ylabel(ylab, fontsize=8, color=_MUT)
+    ax.set_xlabel("image number", fontsize=8, color=_MUT)
+    ax.set_xlim(x0 - xpad, x1 + xpad)
+    if invert and drew:
+        ax.invert_yaxis()
+    if not drew:
+        ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                fontsize=8, color=_MUT, transform=ax.transAxes)
+    if drew and sum(1 for s in specs if s[0]) > 1:
+        ax.legend(fontsize=7.5, frameon=False, loc="best", handlelength=2.0)
+    return drew
+
+
+def _damage_plots(pdf, plt, rows, dataset, title, wilson_method=""):
+    """Combined report page: one continuous step line per metric, flat across
+    each image window (see _step_xy). Panels: high-res limit, R-factors,
+    I/sigma, CC(1/2), Wilson B, cell edges, images."""
+    fig = plt.figure(figsize=(8.4, 11.3))
+    fig.patch.set_facecolor("white")
+    fig.text(0.07, 0.972, dataset, fontsize=17, fontweight="bold", color=_INK)
+    fig.text(0.07, 0.9555,
+             "%s route  ·  radiation-damage indicators vs image number" % title,
+             fontsize=9, color=_MUT)
+    xr = _x_range(rows)
+    nrows = int(math.ceil(len(_DAMAGE_PANELS) / 2.0))
+    for idx, panel in enumerate(_DAMAGE_PANELS, 1):
+        _draw_panel(fig.add_subplot(nrows, 2, idx), panel, rows, xr)
     fig.subplots_adjust(left=0.09, right=0.955, top=0.935, bottom=0.05,
                         hspace=0.42, wspace=0.30)
     pdf.savefig(fig)
     plt.close(fig)
+
+
+def _damage_figs(plt, rows, out_dir, route, suffix=""):
+    """One standalone publication figure per panel — a 600-dpi PNG and a vector
+    SVG — written to <out_dir>/plots_<route><suffix>/<slug>.{png,svg}."""
+    sub = os.path.join(out_dir, "plots_%s%s" % (route, suffix))
+    os.makedirs(sub, exist_ok=True)
+    xr = _x_range(rows)
+    for panel in _DAMAGE_PANELS:
+        slug = panel[4]
+        fig = plt.figure(figsize=(6.0, 3.6))
+        fig.patch.set_facecolor("white")
+        _draw_panel(fig.add_subplot(1, 1, 1), panel, rows, xr)
+        fig.tight_layout()
+        fig.savefig(os.path.join(sub, "%s.png" % slug), dpi=600,
+                    bbox_inches="tight", facecolor="white")
+        fig.savefig(os.path.join(sub, "%s.svg" % slug),
+                    bbox_inches="tight", facecolor="white")   # vector, DPI-free
+        plt.close(fig)
+    return sub
 
 
 # Display rows for the statistics table: (label, kind, *cols). kind is
@@ -1103,7 +1138,7 @@ def _stats_tables(pdf, plt, rows, dataset, title):
 
 
 def write_pdf(path, dataset, title, rows, image_summary, wilson_method="",
-              limit_note=""):
+              limit_note="", route="", suffix=""):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -1140,6 +1175,14 @@ def write_pdf(path, dataset, title, rows, image_summary, wilson_method="",
         if rows:
             _damage_plots(pdf, plt, rows, dataset, title, wilson_method)
             _stats_tables(pdf, plt, rows, dataset, title)
+
+    # Publication figures: one 600-dpi PNG + one SVG per panel, per route.
+    if rows and route:
+        try:
+            sub = _damage_figs(plt, rows, os.path.dirname(path), route, suffix)
+            print("  per-panel figures (PNG+SVG) -> %s" % sub)
+        except Exception as exc:                      # never fail the PDF over PNGs
+            sys.stderr.write("WARNING: per-panel figures failed: %s\n" % exc)
     return True
 
 
@@ -1298,7 +1341,7 @@ def main():
                   rows)
         write_pdf(os.path.join(out_dir, "%s_report%s.pdf" % (route, suffix)),
                   dataset, pretty, rows, image_summary, wmethods[route],
-                  limit_note)
+                  limit_note, route=route, suffix=suffix)
 
     with open(os.path.join(out_dir,
                            "parsing_diagnostics%s.txt" % suffix), "w") as fh:
