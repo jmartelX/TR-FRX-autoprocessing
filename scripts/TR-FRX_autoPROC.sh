@@ -981,9 +981,16 @@ _DAMAGE_PANELS = [
     ("CC(anom)", "CC(ano)", False,
         [("overall", "CC_ano", False, 0, _SOLID),
          ("outer", "CC_ano_outer", False, 1, _SOLID)], "CC-ano"),
-    ("Completeness (spherical)", "completeness (%)", False,
-        [("overall", "Completeness", False, 0, _SOLID),
-         ("outer", "Completeness_outer", False, 1, _SOLID)], "completeness"),
+    # Spherical AND ellipsoidal completeness (overall). For STARANISO the
+    # spherical value is low by design (anisotropic cut-off) while the ellipsoidal
+    # value — completeness within the resolution surface actually used — stays
+    # high; showing both makes that explicit. TRUNCATE has no ellipsoidal value,
+    # so only the spherical line is drawn there. Outer-shell values are in the
+    # per-chunk statistics table.
+    ("Completeness", "completeness (%)", False,
+        [("spherical", "Completeness", False, 0, _SOLID),
+         ("ellipsoidal", "Completeness_ellipsoidal", False, 1, _SOLID)],
+        "completeness"),
     ("Multiplicity", "multiplicity", False,
         [("overall", "Multiplicity", False, 0, _SOLID),
          ("outer", "Multiplicity_outer", False, 1, _SOLID)], "multiplicity"),
