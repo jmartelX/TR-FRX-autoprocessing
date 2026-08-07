@@ -326,7 +326,7 @@ Run it after processing, pointed at an existing ``autoproc_chunks`` directory:
     python trfrx_damage_report.py --process-dir ... --dataset CaMDH_012
 
 It needs only libraries already provided by setup_env.sh (matplotlib, gemmi,
-numpy for the plots / Wilson-B / R_d; the CSV and scraped stats work with the
+numpy for the plots / Wilson-B; the CSV and scraped stats work with the
 Python standard library alone). Every optional dependency is imported
 defensively, so a missing one degrades to a warning rather than a crash.
 
@@ -347,19 +347,24 @@ proxy):
     * High-resolution limit vs dose               (rising = damage)
     * R_merge / R_meas / R_pim vs dose            (rising = damage)
     * Mean I/sigma(I) vs dose                     (falling = damage)
+    * ISa, asymptotic I/sigma vs dose             (falling = damage;
+      Diederichs 2010, Acta Cryst. D66, 733-740)
     * CC(1/2) vs dose                             (falling = damage)
-    * Wilson B-factor and its increase dB vs dose (rising = loss of
+    * CC(anom), anomalous half-set CC vs dose     (falling = anomalous
+      signal decay, an early/sensitive damage reporter)
+    * Completeness (spherical) vs dose            (falling = damage/rejections)
+    * Multiplicity vs dose
+    * Wilson B-factor vs dose                     (rising = loss of
       high-resolution order; the global B-factor "scaling"/decay curve)
-    * Unit-cell edges and volume, % change vs dose (expansion = damage)
-    * Cross-sweep R_d vs dose                      (rising = damage)
+    * Unit-cell edges (true A lengths) vs dose    (expansion = damage)
     * Images actually used per chunk vs dose
 
 Scalar statistics come from the AIMLESS "Summary data" tables and the per-route
-``*.table1`` files. Unit cells are scraped from the same files. The Wilson
-B-factor is scraped when autoPROC prints it and otherwise estimated directly
-from the merged MTZ (relative B: the offset from omitting the atomic scattering
-term cancels in dB across chunks). The cross-sweep R_d and the Wilson B both use
-``gemmi`` to read the merged MTZs.
+``*.table1`` files (CC(ano), completeness, multiplicity included). ISa is scraped
+from the XDS ``CORRECT.LP`` error model. Unit cells come from the same files. The
+Wilson B-factor is scraped when autoPROC prints it and otherwise estimated from
+the merged MTZ via ``gemmi`` (relative B: the offset from omitting the atomic
+scattering term cancels in dB across chunks).
 
 Any statistic that cannot be found is reported as ``N/A`` rather than causing a
 failure; parsing_diagnostics.txt lists every file scanned and value picked so
@@ -388,6 +393,7 @@ METRICS = [
     ("Rpim",                  ["rpim", "all"],                 [],            True),
     ("Mean_I_over_sigma",     ["mean", "sd(i)"],               [],            True),
     ("CC_half",               ["cc(1/2)"],                     [],            True),
+    ("CC_ano",                ["cc(ano)"],                     [],            True),
     ("Completeness",              ["completeness"],                           ["anomalous", "ellipsoidal"], True),
     ("Completeness_ellipsoidal",  ["completeness", "ellipsoidal"],            ["anomalous"],                True),
     ("Multiplicity",              ["multiplicity"],                           ["anomalous"],                True),
@@ -423,6 +429,13 @@ IMAGES_USED_RES = [
     ("images-accepted", re.compile(r"images\s+(?:used|accepted)\s*[:=]?\s*(\d+)", re.I)),
     ("xds-of-images",   re.compile(r"of\s+(\d+)\s+images", re.I)),
 ]
+
+# ISa — asymptotic I/sigma(I) = 1/sqrt(a*b) from the XDS CORRECT.LP error model
+# (Diederichs, 2010, Acta Cryst. D66, 733-740). CORRECT.LP prints a header row
+# "a  b  ISa" followed by the three values; ISa is the third. Higher = better;
+# a fall across the series indicates radiation damage / degrading measurability.
+ISA_RE = re.compile(r"\ba\s+b\s+ISa\b[^\n]*\n\s*[-+.\deE]+\s+[-+.\deE]+\s+([\d.]+)",
+                    re.I)
 
 
 def to_float(value):
@@ -558,6 +571,13 @@ def scrape_cell(text):
     return cell
 
 
+def scrape_isa(text):
+    """Return the last ISa (asymptotic I/sigma) value in *text*, or None.
+    Only XDS CORRECT.LP carries it, so this is a no-op on other files."""
+    found = ISA_RE.findall(text)
+    return to_float(found[-1]) if found else None
+
+
 def scrape_images_used(text):
     """Return (n_images_used, source_tag) or (None, None)."""
     for tag, rex in IMAGES_USED_RES:
@@ -591,8 +611,9 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
     best = {"truncate": None, "staraniso": None}
     best_rank = {"truncate": (-1, -1), "staraniso": (-1, -1)}
     extra = {r: {"cell": None, "mtz": None, "wilson_b": None, "images_used": None,
-                 "wb_source": None,
-                 "cell_rank": -1, "mtz_rank": -1, "wb_rank": -1, "img_rank": -1}
+                 "wb_source": None, "isa": None,
+                 "cell_rank": -1, "mtz_rank": -1, "wb_rank": -1, "img_rank": -1,
+                 "isa_rank": -1}
              for r in ("truncate", "staraniso")}
 
     def consider(route, metrics, fname, rel):
@@ -605,11 +626,15 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
             best_rank[route] = rank
             best[route] = {"metrics": metrics, "source": rel}
 
-    def consider_extra(route, fname, rel, cell, wilson, images):
+    def consider_extra(route, fname, rel, cell, wilson, images, isa=None):
         prio = source_priority(fname)
         e = extra[route]
         if cell is not None and prio > e["cell_rank"]:
             e["cell"], e["cell_rank"] = cell, prio
+        # ISa is route-agnostic (one XDS integration feeds both routes).
+        if isa is not None and prio > e["isa_rank"]:
+            e["isa"], e["isa_rank"] = isa, prio
+            diagnostics.append("    [%s] ISa = %s <- %s" % (route, isa, rel))
         # Wilson B: penalise the _early/_late radiation-damage half-sets so the
         # full-data value (e.g. truncate.log) wins over truncate_late.log.
         wb_prio = prio - 3 if ("_late" in fname.lower()
@@ -645,11 +670,12 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
                   else scrape_wilson_b(text))
         images = scrape_images_used(text)
         images = images if images[0] is not None else None
-        # Unit cell / images used are route-agnostic — record for both so the
+        isa = scrape_isa(text)
+        # Unit cell / images used / ISa are route-agnostic — record for both so the
         # STARANISO route is not left blank when only a truncate log has them.
         for r in ("truncate", "staraniso"):
             consider_extra(r, fname, rel, cell,
-                           wilson if r == route_of_file else None, images)
+                           wilson if r == route_of_file else None, images, isa)
         if low.endswith(".table1"):
             consider(route_of_file, parse_table1(text), fname, rel)
         elif low.endswith(".log") or low.endswith(".lp"):
@@ -686,7 +712,9 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
     # files per chunk): the loose *.table1 / aimless logs are absent, but
     # summary.tar.gz still carries them. Only opened when a route has no metrics
     # yet, and only its small text members are read.
-    if tarballs and (best["truncate"] is None or best["staraniso"] is None):
+    _need_tar = (best["truncate"] is None or best["staraniso"] is None
+                 or extra["truncate"]["isa"] is None)
+    if tarballs and _need_tar:
         import tarfile
         for tpath in tarballs:
             try:
@@ -700,9 +728,10 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
                     if not member.isfile():
                         continue
                     mlow = member.name.lower()
-                    if not (mlow.endswith(".table1") or mlow.endswith(".log")):
+                    if not (mlow.endswith(".table1") or mlow.endswith(".log")
+                            or mlow.endswith(".lp")):     # .lp -> CORRECT.LP (ISa)
                         continue
-                    if member.size > 2_000_000:
+                    if member.size > 2_000_000:           # skip huge INTEGRATE.LP
                         continue
                     fh = tf.extractfile(member)
                     if fh is None:
@@ -729,9 +758,10 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
         e = extra[route]
         data.update({"cell": e["cell"], "mtz": e["mtz"],
                      "wilson_b": e["wilson_b"], "wb_source": e["wb_source"],
-                     "images_used": e["images_used"]})
+                     "images_used": e["images_used"], "isa": e["isa"]})
         has_any = (best[route] or e["cell"] or e["mtz"]
-                   or e["wilson_b"] is not None or e["images_used"] is not None)
+                   or e["wilson_b"] is not None or e["images_used"] is not None
+                   or e["isa"] is not None)
         result[route] = data if has_any else None
     return result
 
@@ -762,6 +792,8 @@ def build_row(chunk_name, first, last, block, wilson_b, images_used,
             row.append((col + "_outer", values[2] if values else "N/A"))
     cell = block.get("cell") if block else None
     vol = cell_volume(cell) if cell else None
+    isa = block.get("isa") if block else None
+    row.append(("Isa", "%.2f" % isa if isa is not None else "N/A"))
     row.append(("Wilson_B", "%.2f" % wilson_b if wilson_b is not None else "N/A"))
     row.append(("Wilson_B_source", wilson_source))
     names = ["cell_a", "cell_b", "cell_c", "cell_al", "cell_be", "cell_ga"]
@@ -786,7 +818,7 @@ def write_csv(path, rows):
 
 
 # --------------------------------------------------------------------------
-# gemmi-based quantities: Wilson B (from merged intensities) and cross-sweep R_d.
+# gemmi-based quantity: Wilson B (from merged intensities).
 # --------------------------------------------------------------------------
 def _read_mtz_intensities(mtz_path):
     """Return (miller_dict {(h,k,l): I}, inv_d2_array, I_array) or (None,..)."""
@@ -941,9 +973,20 @@ _DAMAGE_PANELS = [
     ("Mean I / σ(I)", "I/σ", False,
         [("overall", "Mean_I_over_sigma", False, 0, _SOLID),
          ("outer", "Mean_I_over_sigma_outer", False, 1, _SOLID)], "I-over-sigma"),
+    ("ISa  (asymptotic I/σ)", "ISa", False,
+        [("", "Isa", False, 0, _SOLID)], "ISa"),
     ("CC½", "CC½", False,
         [("overall", "CC_half", False, 0, _SOLID),
          ("outer", "CC_half_outer", False, 1, _SOLID)], "CC-half"),
+    ("CC(anom)", "CC(ano)", False,
+        [("overall", "CC_ano", False, 0, _SOLID),
+         ("outer", "CC_ano_outer", False, 1, _SOLID)], "CC-ano"),
+    ("Completeness (spherical)", "completeness (%)", False,
+        [("overall", "Completeness", False, 0, _SOLID),
+         ("outer", "Completeness_outer", False, 1, _SOLID)], "completeness"),
+    ("Multiplicity", "multiplicity", False,
+        [("overall", "Multiplicity", False, 0, _SOLID),
+         ("outer", "Multiplicity_outer", False, 1, _SOLID)], "multiplicity"),
     ("Wilson B-factor", "B (Å²)", False,
         [("", "Wilson_B", False, 0, _SOLID)], "Wilson-B"),
     # Unit-cell edges as TRUE Ångström lengths (not % change). a = b by symmetry,
@@ -1012,18 +1055,21 @@ def _damage_plots(pdf, plt, rows, dataset, title, wilson_method=""):
     """Combined report page: one continuous step line per metric, flat across
     each image window (see _step_xy). Panels: high-res limit, R-factors,
     I/sigma, CC(1/2), Wilson B, cell edges, images."""
-    fig = plt.figure(figsize=(8.4, 11.3))
+    nrows = int(math.ceil(len(_DAMAGE_PANELS) / 2.0))
+    # Page height scales with the number of rows so panels keep their aspect as
+    # metrics are added/removed (2.35*nrows + 1.9 == 11.3 in at 4 rows).
+    fig = plt.figure(figsize=(8.4, 2.35 * nrows + 1.9))
     fig.patch.set_facecolor("white")
-    fig.text(0.07, 0.972, dataset, fontsize=17, fontweight="bold", color=_INK)
-    fig.text(0.07, 0.9555,
+    htop = 1.0 - 0.75 / (2.35 * nrows + 1.9)          # header just under the top
+    fig.text(0.07, htop, dataset, fontsize=17, fontweight="bold", color=_INK)
+    fig.text(0.07, htop - 0.017,
              "%s route  ·  radiation-damage indicators vs image number" % title,
              fontsize=9, color=_MUT)
     xr = _x_range(rows)
-    nrows = int(math.ceil(len(_DAMAGE_PANELS) / 2.0))
     for idx, panel in enumerate(_DAMAGE_PANELS, 1):
         _draw_panel(fig.add_subplot(nrows, 2, idx), panel, rows, xr)
-    fig.subplots_adjust(left=0.09, right=0.955, top=0.935, bottom=0.05,
-                        hspace=0.42, wspace=0.30)
+    fig.subplots_adjust(left=0.09, right=0.955, top=htop - 0.035, bottom=0.04,
+                        hspace=0.50, wspace=0.30)
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -1056,7 +1102,9 @@ TABLE_SPEC = [
     ("Rmeas",                   "ovouter", "Rmeas"),
     ("Rpim",                    "ovouter", "Rpim"),
     ("I / sigma(I)",            "ovouter", "Mean_I_over_sigma"),
+    ("ISa",                     "plain",   "Isa"),
     ("CC(1/2)",                 "ovouter", "CC_half"),
+    ("CC(ano)",                 "ovouter", "CC_ano"),
     ("Completeness (%)",        "ovouter", "Completeness"),
     ("Completeness ellip. (%)", "ovouter", "Completeness_ellipsoidal"),
     ("Multiplicity",            "ovouter", "Multiplicity"),
