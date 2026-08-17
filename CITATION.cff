@@ -4,7 +4,7 @@ title: "TR-FRX-autoprocessing"
 authors:
   - family-names: "Martel"
     given-names: "Julien M. J."
-    # orcid: "https://orcid.org/XXXX-XXXX-XXXX-XXXX"   # TODO: add your ORCID
+    orcid: "https://orcid.org/0009-0009-7747-7652"
 repository-code: "https://github.com/jmartelX/TR-FRX-autoprocessing"
 license: MIT
 preferred-citation:
