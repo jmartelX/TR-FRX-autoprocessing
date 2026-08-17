@@ -266,6 +266,11 @@ this repository"** button on the repo page.
 Released under the [MIT License](LICENSE) — free to use, modify and
 redistribute with attribution.
 
+## Acknowledgements
+
+Parts of this codebase were developed with the assistance of
+[Claude Code](https://claude.com/claude-code) (Anthropic).
+
 ## Contact
 
 Julien Martel · [@jmartelX](https://github.com/jmartelX)
