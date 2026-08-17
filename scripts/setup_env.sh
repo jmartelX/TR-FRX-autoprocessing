@@ -20,7 +20,7 @@
 # ============================================================
 
 VENV="$HOME/.venv/trfrx"
-PKGS="numpy pandas gemmi scipy matplotlib dask seaborn"
+PKGS="numpy pandas gemmi scipy matplotlib dask seaborn h5py"
 MODULES="phenix ccp4 pymol xds autoPROC H5ToXds"
 
 # --- make sure we were sourced (otherwise activation would be lost) ---
@@ -54,6 +54,13 @@ unset PYTHONHOME PYTHONPATH 2>/dev/null || true
 if [ -f "$VENV/bin/activate" ]; then
     echo "[trfrx] environment found — activating $VENV"
     source "$VENV/bin/activate"
+    # ensure h5py is present in a pre-existing env (added later for Eiger header reading; idempotent)
+    if ! python -c "import h5py" 2>/dev/null; then
+        echo "[trfrx] h5py missing in existing env — installing ..."
+        python -m pip install h5py >/dev/null 2>&1 \
+            && echo "[trfrx] h5py installed." \
+            || echo "[trfrx] warning: could not install h5py (Eiger header reading will fall back)."
+    fi
 else
     echo "[trfrx] no environment yet — creating $VENV and installing dependencies ..."
     _base="$(command -v phenix.python || command -v python3 || true)"

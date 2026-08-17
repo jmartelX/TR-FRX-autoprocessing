@@ -85,7 +85,7 @@ chmod +x scripts/*.py scripts/*.sh
 
 ## Full walkthrough
 
-Throughout, replace `CaMDH_001` / paths / templates with your own dataset.
+Throughout, replace `SAMPLE` / paths / templates with your own dataset.
 
 ### Step 0 — Submit chunked autoPROC jobs
 
@@ -97,20 +97,20 @@ are documented in the script header):
 
 | Variable | Description | Example |
 |---|---|---|
-| `RUN_ID` | Dataset run number | `001` |
-| `IMAGE_TEMPLATE` | Image template (`####` = frame no.) or HDF5 master | `CaMDH_001_1_####.cbf` |
+| `RUN_ID` | Dataset run number | `006` |
+| `IMAGE_TEMPLATE` | Image template (`####` = frame no.) or HDF5 master | `SAMPLE_1_####.cbf` |
 | `FIRST_IMG` / `LAST_IMG` | Total frame range | `1` / `3000` |
 | `REF_FIRST_IMG` / `REF_LAST_IMG` | Reference chunk range | `1` / `300` |
 | `CHUNK_SIZE` | Frames per subsequent chunk | `300` |
-| `SYMM` | Space group | `P3121` |
-| `CELL` | Unit-cell parameters | `107 107 103 90 90 120` |
+| `SYMM` | Space group (edit for your crystal) | `I41` |
+| `CELL` | Unit-cell parameters (edit for your crystal) | `114 114 118 90 90 90` |
 | `SLURM_PARTITION` | SLURM partition | `nice` |
 | `SLURM_CPUS` / `SLURM_MEM` | Resources per job | `24` / `24000` |
 
 Then:
 
 ```bash
-cd /data/images/CaMDH_001
+cd /data/images/SAMPLE
 ./path/to/TR-FRX-autoprocessing/scripts/TR-FRX_autoPROC.sh
 ```
 
@@ -147,7 +147,7 @@ Everything downstream is a single script. Point it at your **model**, the
 **autoproc_chunks** folder from Step 0, and an **output** folder:
 
 ```bash
-python path/to/scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  ./
+python path/to/scripts/trfrx_full_pipeline.py  model.pdb  /data/images/SAMPLE/autoproc_chunks  ./
 ```
 
 It asks for a **dataset name** and whether to use the **staraniso** or
@@ -164,7 +164,7 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 **Output layout** — numbered reruns; copy/clean/dimple are shared across reruns:
 
 ```
-/data/processed/PfuGRHPR_006/
+/data/processed/SAMPLE/
     autoproc_copy/                  # copied chunks (created once)
     run_01/
         analysis/                   # cleaned MTZ, final.pdb, output_dfo/, output_svd/
@@ -235,12 +235,12 @@ whether it entered the SVD, and a short quality verdict
 source scripts/setup_env.sh
 
 # 0. edit variables, then submit autoPROC from the image folder
-cd /data/images/PfuGRHPR_006
+cd /data/images/SAMPLE
 bash /path/to/scripts/TR-FRX_autoPROC.sh          # → wait for SLURM
 
 # 1+. after all SLURM jobs finish, run the full pipeline
-python scripts/trfrx_full_pipeline.py  model.pdb  /data/images/PfuGRHPR_006/autoproc_chunks  /data/processed
-#     → /data/processed/PfuGRHPR_006/run_01/report.html
+python scripts/trfrx_full_pipeline.py  model.pdb  /data/images/SAMPLE/autoproc_chunks  /data/processed
+#     → /data/processed/SAMPLE/run_01/report.html
 ```
 
 ---

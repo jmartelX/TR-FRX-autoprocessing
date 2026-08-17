@@ -27,3 +27,6 @@ env/
 *.csv
 *.log
 *.eff
+
+# Local experimental variant (not for release)
+scripts/TR-FRX_autoPROC_qcfix.sh

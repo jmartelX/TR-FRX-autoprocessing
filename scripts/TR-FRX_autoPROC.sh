@@ -3,8 +3,8 @@
 # TR-FRX autoPROC chunked processing + consolidated reports.
 #
 # Handles BOTH input types automatically:
-#   * CBF   : a template with #### placeholders, e.g. PfuGRHPR_006_1_####.cbf
-#   * HDF5  : an Eiger master file,               e.g. PfuGR_003_001_master.h5
+#   * CBF   : a template with #### placeholders, e.g. SAMPLE_1_####.cbf
+#   * HDF5  : an Eiger master file,               e.g. SAMPLE_001_master.h5
 # The mode is detected from the file extension (override via the 1st argument).
 #
 # After all chunks finish, a final SLURM job regroups the final statistics into
@@ -19,11 +19,11 @@
 # Usage:
 #   # Old way (run from the directory containing the images / master file):
 #   ./TR-FRX_autoPROC.sh                           # use IMAGE_TEMPLATE set below
-#   ./TR-FRX_autoPROC.sh PfuGR_003_001_master.h5   # override the input file
+#   ./TR-FRX_autoPROC.sh SAMPLE_001_master.h5   # override the input file
 #
 #   # Read images from one place, write results to another:
 #   ./TR-FRX_autoPROC.sh <input_dir> <output_dir>
-#   ./TR-FRX_autoPROC.sh <input_dir> <output_dir> PfuGR_003_001_master.h5
+#   ./TR-FRX_autoPROC.sh <input_dir> <output_dir> SAMPLE_001_master.h5
 #
 #   # Reports ONLY — regenerate the statistics from chunks already processed,
 #   # without re-running autoPROC. Asks for an image limit (Enter = all):
@@ -43,7 +43,7 @@ set -euo pipefail
 RUN_ID=006
 
 # CBF template (with ####) OR Eiger master .h5 file. Auto-detected below.
-IMAGE_TEMPLATE="PfuGRHPR_006_1_####.cbf"
+IMAGE_TEMPLATE="SAMPLE_1_####.cbf"
 
 FIRST_IMG=1
 LAST_IMG=3000
@@ -52,27 +52,45 @@ REF_FIRST_IMG=1
 REF_LAST_IMG=300
 CHUNK_SIZE=300
 
+# --- Real per-dataset acquisition time -------------------------------------
+# The report computes a true time window [t_start, t_end] for every dataset and
+# writes reports/time_windows.csv. Leave FRAME_TIME_MS / OSC_PER_IMAGE blank to
+# read them from the image header (CBF "Exposure_period" / Eiger "frame_time");
+# set them only to override when the header is missing or wrong.
+#
+# Time origin: image T0_IMAGE happens at T0_SECONDS, so t(i)=T0_SECONDS+(i-T0_IMAGE)*frame_time.
+# Leave T0_IMAGE BLANK (default) => t=0 at the END of the reference chunk, i.e. the
+# reference dataset is 0 s and every later chunk's time is the time at its LAST image
+# ((image_last - ref_last_image) * frame_time). Set T0_IMAGE/T0_SECONDS explicitly only
+# for a pump/mix experiment whose trigger is a known image at a known clock time.
+FRAME_TIME_MS=""      # per-image frame period in ms (incl. dead time)
+OSC_PER_IMAGE=""      # oscillation per image in degrees
+T0_IMAGE=""           # blank = end of reference chunk (t0=0 there); or a trigger image index
+T0_SECONDS=0          # absolute seconds assigned to T0_IMAGE
+
+# Space group and unit cell — EDIT these to match your crystal (example values).
 SYMM="I41"
 CELL="114 114 118 90 90 90"
 
+# SLURM partition — EDIT to match your cluster.
 SLURM_PARTITION="nice"
 SLURM_CPUS=24
 SLURM_MEM=24000
 # =====================================================================
 
-# ----------------------- Arguments en ligne de commande -----------------------
-# Quatre façons de lancer le script :
-#   ./TR-FRX_autoPROC.sh                                     # ancienne méthode :
-#                                                            #   images ET résultats
-#                                                            #   dans le dossier courant
-#   ./TR-FRX_autoPROC.sh master.h5                           # + override du fichier
-#   ./TR-FRX_autoPROC.sh <input_dir> <output_dir>           # lire ici, écrire là
-#   ./TR-FRX_autoPROC.sh <input_dir> <output_dir> master.h5 # + override du fichier
+# --------------------------- Command-line arguments ---------------------------
+# Four ways to launch the script:
+#   ./TR-FRX_autoPROC.sh                                     # legacy mode:
+#                                                            #   images AND results
+#                                                            #   in the current dir
+#   ./TR-FRX_autoPROC.sh master.h5                           # + override input file
+#   ./TR-FRX_autoPROC.sh <input_dir> <output_dir>           # read here, write there
+#   ./TR-FRX_autoPROC.sh <input_dir> <output_dir> master.h5 # + override input file
 # -----------------------------------------------------------------------------
 IMAGES_DIR="$(pwd)"
 OUTPUT_DIR="$(pwd)"
 
-# --- Options : --stats (rapports seuls) et --max-image N (limite d'images) ----
+# --- Options: --stats (reports only) and --max-image N (image limit) ----------
 STATS_ONLY=0
 MAX_IMAGE=""
 POSITIONAL=()
@@ -83,20 +101,33 @@ while [ "$#" -gt 0 ]; do
         --max-image|--max-images)
             MAX_IMAGE="${2:-}"
             if [ -z "$MAX_IMAGE" ]; then
-                echo "ERREUR : --max-image demande une valeur (ex : --max-image 2000)" >&2
+                echo "ERROR: --max-image requires a value (e.g. --max-image 2000)" >&2
                 exit 1
             fi
             shift 2 ;;
         --max-image=*|--max-images=*)
             MAX_IMAGE="${1#*=}"; shift ;;
+        # --- Timing / image-header overrides (work in --stats too) -------------
+        --frame-time-ms)   FRAME_TIME_MS="${2:-}"; shift 2 ;;
+        --frame-time-ms=*) FRAME_TIME_MS="${1#*=}"; shift ;;
+        --osc-per-image)   OSC_PER_IMAGE="${2:-}"; shift 2 ;;
+        --osc-per-image=*) OSC_PER_IMAGE="${1#*=}"; shift ;;
+        --images-dir)      IMAGES_DIR="${2:-}"; shift 2 ;;
+        --images-dir=*)    IMAGES_DIR="${1#*=}"; shift ;;
+        --image-template)   IMAGE_TEMPLATE="${2:-}"; shift 2 ;;
+        --image-template=*) IMAGE_TEMPLATE="${1#*=}"; shift ;;
+        --t0-image)   T0_IMAGE="${2:-}"; shift 2 ;;
+        --t0-image=*) T0_IMAGE="${1#*=}"; shift ;;
+        --t0-seconds)   T0_SECONDS="${2:-}"; shift 2 ;;
+        --t0-seconds=*) T0_SECONDS="${1#*=}"; shift ;;
         -h|--help)
-            # En-tête du script jusqu'à la première ligne non commentée
-            # (pas de numéro de ligne codé en dur : reste juste si l'aide grossit).
+            # Script header up to the first non-comment line
+            # (no hard-coded line number: stays correct if the help text grows).
             awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' \
                 "${BASH_SOURCE[0]}"
             exit 0 ;;
         -*)
-            echo "ERREUR : option inconnue '$1' (voir --help)" >&2
+            echo "ERROR: unknown option '$1' (see --help)" >&2
             exit 1 ;;
         *)
             POSITIONAL+=("$1"); shift ;;
@@ -105,123 +136,135 @@ done
 set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
 
 if [ -n "$MAX_IMAGE" ] && ! printf '%s' "$MAX_IMAGE" | grep -Eq '^[0-9]+$'; then
-    echo "ERREUR : --max-image doit être un entier positif (reçu '$MAX_IMAGE')" >&2
+    echo "ERROR: --max-image must be a positive integer (got '$MAX_IMAGE')" >&2
     exit 1
 fi
 
 if [ "$STATS_ONLY" -eq 1 ]; then
-    # Mode rapports : un seul argument optionnel = dossier de sortie OU le dossier
-    # autoproc_chunks lui-même. Aucune image n'est nécessaire.
+    # Reports mode: a single optional argument = output directory OR the
+    # autoproc_chunks folder itself. Statistics need no images; time_windows.csv,
+    # however, needs the frame cadence: either --frame-time-ms, or
+    # --images-dir/--image-template (header reading), or the values from the
+    # CONFIGURATION block at the top of the script.
     case "$#" in
         0) : ;;
         1) OUTPUT_DIR="$1" ;;
         *)
-            echo "Usage : $0 --stats [<dir>] [--max-image N]" >&2
+            echo "Usage: $0 --stats [<dir>] [--max-image N] \\" >&2
+            echo "          [--frame-time-ms MS] [--osc-per-image DEG] \\" >&2
+            echo "          [--images-dir DIR] [--image-template TPL] \\" >&2
+            echo "          [--t0-image N] [--t0-seconds S]" >&2
             exit 1 ;;
     esac
 else
     case "$#" in
-        0) : ;;                                       # tout par défaut (dossier courant)
-        1) IMAGE_TEMPLATE="$1" ;;                      # override du fichier uniquement
-        2) IMAGES_DIR="$1"; OUTPUT_DIR="$2" ;;         # lire dans $1, écrire dans $2
+        0) : ;;                                       # all defaults (current dir)
+        1) IMAGE_TEMPLATE="$1" ;;                      # override input file only
+        2) IMAGES_DIR="$1"; OUTPUT_DIR="$2" ;;         # read from $1, write to $2
         3) IMAGES_DIR="$1"; OUTPUT_DIR="$2"; IMAGE_TEMPLATE="$3" ;;
         *)
-            echo "Usage : $0 [<input_dir> <output_dir>] [image_file]" >&2
+            echo "Usage: $0 [<input_dir> <output_dir>] [image_file]" >&2
             exit 1
             ;;
     esac
 fi
 
-# --- Chemins absolus (les nœuds de calcul SLURM doivent voir ces dossiers) ---
-# En mode --stats aucune image n'est lue : on ne vérifie donc que le dossier de
-# sortie (qui doit déjà exister, on ne le crée pas pour éviter les fautes de frappe).
+# --- Absolute paths (SLURM compute nodes must be able to see these dirs) ---
+# In --stats mode no image is read, so we only check the output directory
+# (which must already exist; we don't create it, to avoid typos).
 if [ "$STATS_ONLY" -eq 0 ]; then
     if [ ! -d "$IMAGES_DIR" ]; then
-        echo "ERREUR : dossier d'entrée introuvable : $IMAGES_DIR" >&2
+        echo "ERROR: input directory not found: $IMAGES_DIR" >&2
         exit 1
     fi
     IMAGES_DIR="$(cd "$IMAGES_DIR" && pwd)"
     mkdir -p "$OUTPUT_DIR"
 else
     if [ ! -d "$OUTPUT_DIR" ]; then
-        echo "ERREUR : dossier introuvable : $OUTPUT_DIR" >&2
+        echo "ERROR: directory not found: $OUTPUT_DIR" >&2
         exit 1
+    fi
+    # In --stats, if an images directory is provided (config or --images-dir),
+    # make it absolute so the header reading (time_windows.csv) can find it;
+    # otherwise continue (the user may pass --frame-time-ms instead).
+    if [ -d "$IMAGES_DIR" ]; then
+        IMAGES_DIR="$(cd "$IMAGES_DIR" && pwd)"
     fi
 fi
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Détection du mode d'après l'extension du fichier d'entrée (traitement seul) ---
+# --- Detect mode from the input file extension (processing only) ---
 if [ "$STATS_ONLY" -eq 0 ]; then
     case "$IMAGE_TEMPLATE" in
         *.h5|*.H5|*.nxs|*.NXS) INPUT_MODE="HDF5" ;;
         *.cbf|*.CBF)           INPUT_MODE="CBF" ;;
         *)
-            echo "ERREUR : type d'entrée non reconnu pour '$IMAGE_TEMPLATE' (attendu .cbf ou .h5)" >&2
+            echo "ERROR: unrecognized input type for '$IMAGE_TEMPLATE' (expected .cbf or .h5)" >&2
             exit 1
             ;;
     esac
-    echo "Mode d'entrée : $INPUT_MODE ($IMAGE_TEMPLATE)"
+    echo "Input mode: $INPUT_MODE ($IMAGE_TEMPLATE)"
     module load autoPROC
 fi
 
-# --- Tous les traitements seront créés dans un sous-dossier du dossier de sortie ---
-# En mode --stats, l'argument peut désigner soit un dossier CONTENANT les chunks
-# autoPROC_<first>_<last> (quel que soit son nom : autoproc_chunks, autoproc_copy,
-# un dossier de timepoint...), soit son dossier parent. Détection par le contenu,
-# pas par le nom, pour accepter toutes les arborescences.
+# --- All processing runs go into a sub-folder of the output directory ---
+# In --stats mode, the argument may point either at a folder CONTAINING the
+# autoPROC_<first>_<last> chunks (whatever its name: autoproc_chunks, autoproc_copy,
+# a timepoint folder...), or at its parent folder. Detection is by content,
+# not by name, so all directory layouts are accepted.
 PROCESS_DIR="${OUTPUT_DIR}/autoproc_chunks"
 
 if [ "$STATS_ONLY" -eq 1 ]; then
-    # ---------------- Mode rapports seuls : pas d'autoPROC ----------------
-    # Deux arborescences sont acceptées (détection par le contenu, pas par le nom) :
-    #   plate    : <dir>/autoPROC_1_150           (TR-FRX_autoPROC.sh)
-    #   imbriquée: <dir>/1_150/autoPROC_1_150     (copie de trfrx_full_pipeline)
+    # ---------------- Reports-only mode: no autoPROC ----------------
+    # Two directory layouts are accepted (detection by content, not by name):
+    #   flat   : <dir>/autoPROC_1_150           (TR-FRX_autoPROC.sh)
+    #   nested : <dir>/1_150/autoPROC_1_150      (copy from trfrx_full_pipeline)
     if ls -d "$OUTPUT_DIR"/autoPROC_*_* >/dev/null 2>&1; then
-        PROCESS_DIR="$OUTPUT_DIR"                        # chunks directement ici
+        PROCESS_DIR="$OUTPUT_DIR"                        # chunks directly here
     elif [ -d "$PROCESS_DIR" ]; then
         :                                                # <dir>/autoproc_chunks
     elif ls -d "$OUTPUT_DIR"/*/autoPROC_*_* >/dev/null 2>&1; then
-        PROCESS_DIR="$OUTPUT_DIR"                        # arborescence imbriquée
+        PROCESS_DIR="$OUTPUT_DIR"                        # nested layout
     fi
     if [ ! -d "$PROCESS_DIR" ]; then
-        echo "ERREUR : dossier de chunks introuvable : $PROCESS_DIR" >&2
-        echo "         (lancez le script depuis le dossier de sortie, ou passez-le" >&2
-        echo "          en argument : $0 --stats /chemin/vers/sortie)" >&2
+        echo "ERROR: chunk directory not found: $PROCESS_DIR" >&2
+        echo "         (run the script from the output directory, or pass it" >&2
+        echo "          as an argument: $0 --stats /path/to/output)" >&2
         exit 1
     fi
-    # Chunks disponibles (autoPROC_<first>_<last>), triés par première image.
-    # maxdepth 2 : couvre l'arborescence plate ET l'arborescence imbriquée
-    # (<dir>/1_150/autoPROC_1_150) produite par trfrx_full_pipeline.
-    # -L : suit les liens symboliques (dossiers de chunks parfois liés).
+    # Available chunks (autoPROC_<first>_<last>), sorted by first image.
+    # maxdepth 2: covers both the flat layout AND the nested layout
+    # (<dir>/1_150/autoPROC_1_150) produced by trfrx_full_pipeline.
+    # -L: follows symlinks (chunk folders are sometimes linked).
     CHUNK_DIRS=$(find -L "$PROCESS_DIR" -maxdepth 2 -type d -name 'autoPROC_*_*' \
                  -exec basename {} \; 2>/dev/null \
                  | sed -E 's/^autoPROC_([0-9]+)_([0-9]+)$/\1 \2/' \
                  | grep -E '^[0-9]+ [0-9]+$' | sort -n -u)
     if [ -z "$CHUNK_DIRS" ]; then
-        echo "ERREUR : aucun chunk autoPROC_<first>_<last> dans $PROCESS_DIR" >&2
+        echo "ERROR: no autoPROC_<first>_<last> chunk in $PROCESS_DIR" >&2
         exit 1
     fi
     N_CHUNKS=$(printf '%s\n' "$CHUNK_DIRS" | wc -l | tr -d ' ')
     FIRST_AVAIL=$(printf '%s\n' "$CHUNK_DIRS" | awk '{print $1}' | sort -n | head -1)
     LAST_AVAIL=$(printf '%s\n' "$CHUNK_DIRS" | awk '{print $2}' | sort -n | tail -1)
     echo ""
-    echo "=========== Rapports seuls (pas de retraitement autoPROC) ==========="
-    echo "  Dossier des chunks : $PROCESS_DIR"
-    echo "  Chunks disponibles : $N_CHUNKS   (images $FIRST_AVAIL -> $LAST_AVAIL)"
+    echo "=========== Reports only (no autoPROC reprocessing) ==========="
+    echo "  Chunk directory  : $PROCESS_DIR"
+    echo "  Chunks available : $N_CHUNKS   (images $FIRST_AVAIL -> $LAST_AVAIL)"
     printf '%s\n' "$CHUNK_DIRS" | awk '{printf "      images %s-%s\n", $1, $2}'
-    echo "===================================================================="
-    # Demande interactive de la limite (Enter = tout). Un chunk qui dépasse la
-    # limite est EXCLU (jamais tronqué) : limite 2000 -> ...1801-2000 conservé,
-    # 2001-2200 écarté.
+    echo "==============================================================="
+    # Interactive limit prompt (Enter = all). A chunk that exceeds the limit
+    # is EXCLUDED (never truncated): limit 2000 -> ...1801-2000 kept,
+    # 2001-2200 dropped.
     if [ -z "$MAX_IMAGE" ]; then
         while true; do
-            printf "Image maximale pour les statistiques [Entrée = tout (%s)] : " "$LAST_AVAIL"
+            printf "Maximum image for statistics [Enter = all (%s)]: " "$LAST_AVAIL"
             if ! read -r ANSWER; then ANSWER=""; echo; fi
             ANSWER="$(printf '%s' "$ANSWER" | tr -d '[:space:]')"
             if [ -z "$ANSWER" ]; then
-                MAX_IMAGE=""            # aucune limite
+                MAX_IMAGE=""            # no limit
                 break
             fi
             if printf '%s' "$ANSWER" | grep -Eq '^[0-9]+$'; then
@@ -229,29 +272,29 @@ if [ "$STATS_ONLY" -eq 1 ]; then
                        | awk -v lim="$ANSWER" '$2 <= lim' | wc -l | tr -d ' ')
                 if [ "$KEPT" -eq 0 ]; then
                     FIRST_END=$(printf '%s\n' "$CHUNK_DIRS" | head -1 | awk '{print $2}')
-                    echo "  $ANSWER exclut tous les chunks (le premier finit à $FIRST_END). Réessayez."
+                    echo "  $ANSWER excludes all chunks (the first one ends at $FIRST_END). Try again."
                     continue
                 fi
                 LAST_KEPT=$(printf '%s\n' "$CHUNK_DIRS" \
                             | awk -v lim="$ANSWER" '$2 <= lim' | tail -1)
                 MAX_IMAGE="$ANSWER"
-                echo "  -> $KEPT chunk(s) conservés ; dernier = images ${LAST_KEPT% *}-${LAST_KEPT#* }"
+                echo "  -> $KEPT chunk(s) kept; last = images ${LAST_KEPT% *}-${LAST_KEPT#* }"
                 break
             fi
-            echo "  '$ANSWER' n'est pas un entier — tapez un nombre (ex : 2000) ou Entrée."
+            echo "  '$ANSWER' is not an integer — type a number (e.g. 2000) or Enter."
         done
     fi
     if [ -n "$MAX_IMAGE" ]; then
-        echo "  Limite retenue : images <= $MAX_IMAGE  (fichiers suffixés _upto${MAX_IMAGE})"
+        echo "  Limit applied: images <= $MAX_IMAGE  (files suffixed _upto${MAX_IMAGE})"
     else
-        echo "  Aucune limite : tous les chunks sont inclus."
+        echo "  No limit: all chunks are included."
     fi
     echo ""
 else
     mkdir -p "$PROCESS_DIR"
 fi
 
-# --- Identifiants des jobs de traitement (pour le rapport final) ---
+# --- Processing job IDs (for the final report) ---
 CHUNK_JOBIDS=()
 CHUNK_LABELS=()
 
@@ -260,7 +303,7 @@ FIRST_JOBID=""
 
 if [ "$STATS_ONLY" -eq 0 ]; then
 
-# --- Traitement du jeu de référence ---
+# --- Process the reference dataset ---
 REF_JOB_BASENAME="${REF_FIRST_IMG}-${REF_LAST_IMG}_autoproc"
 REF_JOB_SCRIPT="${PROCESS_DIR}/${REF_JOB_BASENAME}.sh"
 REF_OUTDIR="${PROCESS_DIR}/autoPROC_${REF_FIRST_IMG}_${REF_LAST_IMG}"
@@ -277,10 +320,10 @@ sbatch_output=$(sbatch -p "$SLURM_PARTITION" -n 1 -c "$SLURM_CPUS" --mem="$SLURM
 FIRST_JOBID=$(echo "$sbatch_output" | awk '{print $4}')
 FIRST_OUTDIR="$REF_OUTDIR"
 CHUNK_JOBIDS+=("$FIRST_JOBID")
-CHUNK_LABELS+=("${REF_FIRST_IMG}-${REF_LAST_IMG} (référence)")
-echo "  [soumis] job $FIRST_JOBID : images ${REF_FIRST_IMG}-${REF_LAST_IMG} (référence)"
+CHUNK_LABELS+=("${REF_FIRST_IMG}-${REF_LAST_IMG} (reference)")
+echo "  [submitted] job $FIRST_JOBID: images ${REF_FIRST_IMG}-${REF_LAST_IMG} (reference)"
 
-# --- Traitement des jeux suivants par blocs ---
+# --- Process the following datasets in chunks ---
 i=$((REF_LAST_IMG + 1))
 
 while [ "$i" -le "$LAST_IMG" ]; do
@@ -305,15 +348,15 @@ EOF
     CHUNK_JOBID=$(echo "$chunk_output" | awk '{print $4}')
     CHUNK_JOBIDS+=("$CHUNK_JOBID")
     CHUNK_LABELS+=("${i}-${j}")
-    echo "  [soumis] job $CHUNK_JOBID : images ${i}-${j} (dépend de $FIRST_JOBID)"
+    echo "  [submitted] job $CHUNK_JOBID: images ${i}-${j} (depends on $FIRST_JOBID)"
 
     i=$((j + 1))
 done
 
-fi   # fin du bloc de soumission autoPROC (ignoré en mode --stats)
+fi   # end of the autoPROC submission block (skipped in --stats mode)
 
 # =====================================================================
-# --- Générateur de rapports (écrit dans PROCESS_DIR, puis lancé) ------
+# --- Report generator (written to PROCESS_DIR, then launched) ---------
 # =====================================================================
 cat > "$PROCESS_DIR/trfrx_damage_report.py" <<'PYEOF'
 #!/usr/bin/env python3
@@ -323,7 +366,7 @@ Standalone tool (development version — not yet wired into TR-FRX_autoPROC.sh).
 Run it after processing, pointed at an existing ``autoproc_chunks`` directory:
 
     python trfrx_damage_report.py --process-dir /path/to/autoproc_chunks
-    python trfrx_damage_report.py --process-dir ... --dataset CaMDH_012
+    python trfrx_damage_report.py --process-dir ... --dataset SAMPLE
 
 It needs only libraries already provided by setup_env.sh (matplotlib, gemmi,
 numpy for the plots / Wilson-B; the CSV and scraped stats work with the
@@ -775,14 +818,19 @@ def match_metric(metrics, must, mustnot):
 
 
 def build_row(chunk_name, first, last, block, wilson_b, images_used,
-              wilson_source="N/A"):
+              wilson_source="N/A", t_start=None, t_end=None, t_mid=None):
     """Return an ordered list of (column, value) for one chunk."""
+    def _ts(v):
+        return "%.3f" % v if v is not None else "N/A"
     row = [
         ("chunk", chunk_name),
         ("image_first", first),
         ("image_last", last),
         ("n_images", last - first + 1),
         ("images_used", images_used if images_used is not None else "N/A"),
+        ("t_start_s", _ts(t_start)),
+        ("t_end_s", _ts(t_end)),
+        ("t_mid_s", _ts(t_mid)),
     ]
     metrics = block["metrics"] if block else {}
     for col, must, mustnot, want_outer in METRICS:
@@ -815,6 +863,186 @@ def write_csv(path, rows):
         writer = csv.writer(fh)
         writer.writerow(headers)
         writer.writerows(rows_out)
+
+
+# --------------------------------------------------------------------------
+# Real per-dataset time: read the frame period + oscillation from ONE image
+# header (they are constant across a rotation series), then map every chunk's
+# image window to a time window. CBF (miniCBF ASCII) and Eiger HDF5 masters are
+# both supported; every read is defensive and degrades to a warning, never a
+# crash. Explicit --frame-time-ms / --osc-per-image overrides always win.
+# --------------------------------------------------------------------------
+def _resolve_image_path(images_dir, template):
+    """Best-effort path to a single image whose header we can read.
+
+    Eiger: the template IS the master .h5 (one file). CBF: the template carries
+    a #### placeholder — glob the images dir for the first matching frame."""
+    if not template:
+        return None
+    base = os.path.join(images_dir, template) if images_dir else template
+    if os.path.isfile(base):
+        return base
+    if "#" in template:
+        import glob
+        pat = os.path.join(images_dir or ".", re.sub(r"#+", "*", template))
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[0]
+    return base   # may not exist; caller handles a missing file
+
+
+def _read_eiger_header(path):
+    """(dt_s, osc_deg, meta) from an Eiger HDF5 master. Multi-key: Dectris NeXus
+    layouts vary (frame_time vs count_time; omega_increment vs omega_range_average
+    vs a per-frame omega array)."""
+    meta = {"reader": "eiger"}
+    try:
+        import h5py
+    except Exception as e:                       # h5py not installed in this env
+        meta["note"] = "h5py unavailable (%s)" % e
+        return None, None, meta
+    try:
+        with h5py.File(path, "r") as f:
+            def g(p):
+                try:
+                    d = f[p]
+                    return d[()] if getattr(d, "shape", None) == () else d[...]
+                except Exception:
+                    return None
+            dt = None
+            for k in ("/entry/instrument/detector/frame_time",
+                      "/entry/instrument/detector/count_time",
+                      "/entry/instrument/detector/detectorSpecific/frame_time"):
+                v = g(k)
+                if v is not None:
+                    dt = float(v); meta["dt_key"] = k; break
+            osc = None
+            for k in ("/entry/sample/goniometer/omega_increment",
+                      "/entry/sample/goniometer/omega_range_average",
+                      "/entry/instrument/detector/goniometer/omega_increment",
+                      "/entry/instrument/detector/goniometer/omega_range_average"):
+                v = g(k)
+                if v is not None:
+                    osc = abs(float(v)); meta["osc_key"] = k; break
+            if osc is None:                       # last resort: diff the omega array
+                arr = g("/entry/sample/goniometer/omega")
+                try:
+                    if arr is not None and len(arr) >= 2:
+                        osc = abs(float(arr[1]) - float(arr[0]))
+                        meta["osc_key"] = "omega[]diff"
+                except TypeError:
+                    pass
+            nimg = g("/entry/instrument/detector/detectorSpecific/nimages")
+            if nimg is not None:
+                meta["nimages"] = int(nimg)
+            wl = g("/entry/instrument/beam/incident_wavelength")
+            if wl is not None:
+                meta["wavelength"] = float(wl)
+        return dt, osc, meta
+    except Exception as e:
+        meta["note"] = "read failed (%s)" % e
+        return None, None, meta
+
+
+def _read_cbf_header(path):
+    """(dt_s, osc_deg, meta) from a PILATUS/Eiger miniCBF ASCII header. Handles
+    both "# Key value unit" (Dectris) and "Key = value" forms."""
+    meta = {"reader": "cbf"}
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read(8192).decode("latin-1", "replace")
+    except Exception as e:
+        meta["note"] = "open failed (%s)" % e
+        return None, None, meta
+
+    def find(key):
+        m = re.search(r"(?mi)^\s*#?\s*%s\s*[=:\s]\s*(%s)" % (re.escape(key), NUM),
+                      text)
+        return float(m.group(1)) if m else None
+
+    dt = find("Exposure_period")                 # frame-to-frame time (incl. dead time)
+    osc = find("Angle_increment")
+    et = find("Exposure_time")
+    sa = find("Start_angle")
+    if et is not None:
+        meta["exposure_time_s"] = et
+    if sa is not None:
+        meta["start_angle_deg"] = sa
+    return dt, (abs(osc) if osc is not None else None), meta
+
+
+def frame_period_from_header(images_dir, template, frame_time_ms=None,
+                             osc_per_image=None):
+    """(dt_s, osc_deg, meta): per-image frame period (s) and oscillation (deg).
+    Overrides win; otherwise auto-detect CBF vs Eiger by extension. dt_s is None
+    only when neither a header nor an override is available (source=UNRESOLVED)."""
+    meta = {"source": ""}
+    dt_s = (frame_time_ms / 1000.0) if frame_time_ms else None
+    osc = osc_per_image if osc_per_image else None
+    if dt_s is not None and osc is not None:
+        meta["source"] = "override"
+        return dt_s, osc, meta
+    path = _resolve_image_path(images_dir, template)
+    meta["image"] = path
+    hdt = hosc = None
+    if path:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".h5", ".hdf5", ".nxs"):
+            hdt, hosc, hmeta = _read_eiger_header(path)
+        elif ext == ".cbf":
+            hdt, hosc, hmeta = _read_cbf_header(path)
+        else:
+            hmeta = {"reader": "unknown-ext"}
+        meta.update(hmeta)
+        if not (path and os.path.isfile(path)):
+            meta.setdefault("note", "image not found: %s" % path)
+    else:
+        meta["note"] = "no image template/dir given"
+    if dt_s is None:
+        dt_s = hdt
+    if osc is None:
+        osc = hosc
+    if dt_s is not None:
+        meta["source"] = meta.get("reader", "header")
+    else:
+        meta["source"] = "UNRESOLVED"
+    return dt_s, osc, meta
+
+
+def time_window(image_first, image_last, dt_s, t0_image=1, t0_s=0.0):
+    """(t_start, t_end, t_mid, duration) in seconds for an image window, using the
+    linear model t(i) = t0_s + (i - t0_image) * dt_s. All None when dt_s is None."""
+    if dt_s is None:
+        return None, None, None, None
+    t_start = t0_s + (image_first - t0_image) * dt_s
+    t_end = t0_s + (image_last - t0_image) * dt_s
+    t_mid = t0_s + (0.5 * (image_first + image_last) - t0_image) * dt_s
+    duration = (image_last - image_first + 1) * dt_s
+    return t_start, t_end, t_mid, duration
+
+
+def write_time_windows_csv(path, chunk_list, dt_s, osc_deg, t0_image, t0_s,
+                           source, images_used_by=None):
+    """Canonical per-dataset time table. One row per chunk (dataset). Written on
+    every run; blank times + source=UNRESOLVED when no header/override was found."""
+    images_used_by = images_used_by or {}
+    cols = ["dataset_id", "image_first", "image_last", "n_images", "images_used",
+            "frame_time_s", "osc_deg", "t_start_s", "t_end_s", "t_mid_s",
+            "t0_image", "t0_s", "source"]
+
+    def f(v, nd=4):
+        return "" if v is None else ("%.*f" % (nd, v))
+
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for name, first, last in chunk_list:
+            ts, te, tm, _dur = time_window(first, last, dt_s, t0_image, t0_s)
+            iu = images_used_by.get(name)
+            w.writerow([name.replace("autoPROC_", ""), first, last,
+                        last - first + 1, ("" if iu is None else iu),
+                        f(dt_s, 6), f(osc_deg, 4), f(ts), f(te), f(tm),
+                        t0_image, f(t0_s), source])
 
 
 # --------------------------------------------------------------------------
@@ -930,6 +1158,11 @@ _PALETTE = ["#4477AA", "#EE6677", "#44AA99"]
 _SOLID   = "-"
 _DASH    = (0, (4, 2.2))
 _INK, _MUT, _GRID, _SPINE = "#1a2530", "#5c6b76", "#eceff2", "#c4ced4"
+
+# Linear image->seconds transform for the secondary (top) x-axis. Set once in
+# main() to (dt_s, t0_image, t0_s) when a frame period is known; left None (no
+# seconds axis) when time is UNRESOLVED. Read by _draw_panel.
+_XTIME = None
 
 
 def _step_xy(rows, col, pct=False):
@@ -1048,6 +1281,16 @@ def _draw_panel(ax, panel, rows, xr):
     ax.set_ylabel(ylab, fontsize=8, color=_MUT)
     ax.set_xlabel("image number", fontsize=8, color=_MUT)
     ax.set_xlim(x0 - xpad, x1 + xpad)
+    if _XTIME and _XTIME[0]:
+        dt, ti, t0 = _XTIME
+        secax = ax.secondary_xaxis(
+            "top",
+            functions=(lambda x, dt=dt, ti=ti, t0=t0: t0 + (x - ti) * dt,
+                       lambda t, dt=dt, ti=ti, t0=t0: ti + (t - t0) / dt))
+        secax.set_xlabel("time (s)", fontsize=8, color=_MUT)
+        secax.tick_params(length=0, labelsize=7.5, colors=_MUT)
+        for sp in secax.spines.values():
+            sp.set_visible(False)
     if invert and drew:
         ax.invert_yaxis()
     if not drew:
@@ -1269,12 +1512,43 @@ def main():
                              "keeps ...1801-2000 and drops 2001-2200. Output "
                              "files get an _upto<N> suffix so the full report "
                              "is never overwritten.")
+    # --- Real-time (acquisition time) options -----------------------------
+    parser.add_argument("--image-template", default=None,
+                        help="CBF template with #### OR an Eiger master .h5, used "
+                             "to read the frame period / oscillation for "
+                             "time_windows.csv.")
+    parser.add_argument("--images-dir", default=None,
+                        help="Directory holding the raw images (for --image-template).")
+    parser.add_argument("--frame-time-ms", type=float, default=None, metavar="MS",
+                        help="Override per-image frame period in ms (else read from header).")
+    parser.add_argument("--osc-per-image", type=float, default=None, metavar="DEG",
+                        help="Override oscillation per image in degrees (else from header).")
+    parser.add_argument("--t0-image", type=int, default=None, metavar="N",
+                        help="Image index taken as t=0. Default: the reference chunk's "
+                             "LAST image, so the reference dataset is 0 s and each later "
+                             "chunk's time is the time at its last image.")
+    parser.add_argument("--t0-seconds", type=float, default=0.0, metavar="S",
+                        help="Absolute seconds assigned to --t0-image (default 0).")
     args = parser.parse_args()
 
     process_dir = os.path.abspath(args.process_dir)
     out_dir = args.out or os.path.join(process_dir, "reports")
     os.makedirs(out_dir, exist_ok=True)
     dataset = detect_dataset(process_dir, args.dataset)
+
+    # Read the frame period + oscillation ONCE (constant across a rotation series).
+    # The time origin (t0_image) is resolved later, once the chunks are known.
+    # Failures degrade to a warning; the CSV is still written with blank times
+    # (source=UNRESOLVED).
+    global _XTIME
+    dt_s, osc_deg, tmeta = frame_period_from_header(
+        args.images_dir, args.image_template, args.frame_time_ms, args.osc_per_image)
+    t0_s = args.t0_seconds
+    tw_source = tmeta.get("source", "UNRESOLVED")
+    if dt_s is None:
+        sys.stderr.write("WARNING: no frame period (%s) — time_windows.csv will have "
+                         "blank times; pass --frame-time-ms/--osc-per-image or check "
+                         "--image-template/--images-dir.\n" % tmeta.get("note", "no header"))
 
     def _scan_chunks(root):
         """(name, first, last, path) for autoPROC_<first>_<last> dirs in *root*."""
@@ -1301,6 +1575,17 @@ def main():
                 entries.extend(_scan_chunks(subdir))
     entries.sort(key=lambda c: c[1])
     chunks = [(n, a, b) for n, a, b, _p in entries]
+    all_chunks = list(chunks)   # full dataset list for time_windows.csv (pre --max-image)
+
+    # Time origin: default t0 = the reference chunk's LAST image (all_chunks is sorted
+    # by image_first, so all_chunks[0] is the reference). Then the reference dataset
+    # ends at t=0 and each later chunk's t_end = (image_last - ref_last_image)*dt_s.
+    # An explicit --t0-image (pump/mix trigger) overrides this default.
+    if args.t0_image is not None:
+        t0_image = args.t0_image
+    else:
+        t0_image = all_chunks[0][2] if all_chunks else 1
+    _XTIME = (dt_s, t0_image, t0_s) if dt_s else None
     chunk_path = dict((n, p) for n, _a, _b, p in entries)
     if not chunks:
         sys.stderr.write("ERROR: no autoPROC_<first>_<last> chunk directory found "
@@ -1345,11 +1630,18 @@ def main():
 
     best_by_chunk = {}
     image_summary = []
+    images_used_by_chunk = {}
     meta = {"truncate": [], "staraniso": []}
     for name, first, last in chunks:
         image_summary.append((name, "%d-%d" % (first, last), last - first + 1))
         best = collect_chunk_blocks(chunk_path[name], diagnostics)
         best_by_chunk[name] = (first, last, best)
+        iu = None
+        for route in ("staraniso", "truncate"):
+            bb = best[route] if best[route] else {}
+            if bb.get("images_used") is not None:
+                iu = bb.get("images_used"); break
+        images_used_by_chunk[name] = iu
         mid = 0.5 * (first + last)
         for route in ("truncate", "staraniso"):
             b = best[route] if best[route] else {}
@@ -1382,7 +1674,9 @@ def main():
             # would be meaningless. MTZ fit is a clearly-flagged last resort only.
             wilson, wsource = route_wilson(route, name)
             images = b.get("images_used") if b else None
-            rows.append(build_row(name, first, last, b, wilson, images, wsource))
+            ts, te, tm, _dur = time_window(first, last, dt_s, t0_image, t0_s)
+            rows.append(build_row(name, first, last, b, wilson, images, wsource,
+                                  t_start=ts, t_end=te, t_mid=tm))
         return rows
 
     wmethods = {
@@ -1402,6 +1696,22 @@ def main():
                            "parsing_diagnostics%s.txt" % suffix), "w") as fh:
         fh.write("\n".join(diagnostics) + "\n")
 
+    # Canonical per-dataset time table — always written, over the FULL chunk set
+    # (independent of --max-image), and consumed by trfrx_full_pipeline.py et al.
+    tw_path = os.path.join(out_dir, "time_windows.csv")
+    write_time_windows_csv(tw_path, all_chunks, dt_s, osc_deg, t0_image, t0_s,
+                           tw_source, images_used_by_chunk)
+    total_s = (len(all_chunks) and dt_s
+               and sum((b - a + 1) for _n, a, b in all_chunks) * dt_s)
+    _t0kind = ("end of reference (auto)" if args.t0_image is None else "explicit")
+    print("time_windows.csv: dt=%s s, osc=%s deg, %d datasets, total=%s s, source=%s"
+          % ("%.6g" % dt_s if dt_s else "N/A",
+             "%.4g" % osc_deg if osc_deg else "N/A",
+             len(all_chunks),
+             "%.4g" % total_s if total_s else "N/A", tw_source))
+    print("  t0 = image %s (%s), t0_s=%s; timepoint = END of each window (t_end_s)"
+          % (t0_image, _t0kind, ("%.4g" % t0_s)))
+
     print("Reports written to %s" % out_dir)
     return 0
 
@@ -1410,18 +1720,33 @@ if __name__ == "__main__":
     sys.exit(main() or 0)
 PYEOF
 
-# Limite d'images éventuelle, transmise au générateur de rapports.
+# Optional image limit, passed through to the report generator.
 REPORT_ARGS=""
 if [ -n "$MAX_IMAGE" ]; then
     REPORT_ARGS="--max-image $MAX_IMAGE"
+fi
+
+# Image context + timing for computing the time windows (time_windows.csv).
+# The quotes are preserved as-is in generate_reports.sh (unquoted EOF heredoc)
+# then re-interpreted at run time — safe even if a path contains a space.
+REPORT_ARGS="$REPORT_ARGS --image-template \"$IMAGE_TEMPLATE\" --images-dir \"$IMAGES_DIR\" --t0-seconds \"$T0_SECONDS\""
+# --t0-image only when set; blank => report defaults it to the reference chunk's last image.
+if [ -n "$T0_IMAGE" ]; then
+    REPORT_ARGS="$REPORT_ARGS --t0-image \"$T0_IMAGE\""
+fi
+if [ -n "$FRAME_TIME_MS" ]; then
+    REPORT_ARGS="$REPORT_ARGS --frame-time-ms \"$FRAME_TIME_MS\""
+fi
+if [ -n "$OSC_PER_IMAGE" ]; then
+    REPORT_ARGS="$REPORT_ARGS --osc-per-image \"$OSC_PER_IMAGE\""
 fi
 
 REPORT_JOB_SCRIPT="${PROCESS_DIR}/generate_reports.sh"
 cat > "$REPORT_JOB_SCRIPT" <<EOF
 #!/bin/bash
 set -euo pipefail
-# autoPROC n'est PAS nécessaire pour les rapports (python + matplotlib + gemmi
-# suffisent) : on charge le module s'il existe, sans faire échouer le script.
+# autoPROC is NOT required for the reports (python + matplotlib + gemmi are
+# enough): load the module if it exists, without letting the script fail.
 if type module >/dev/null 2>&1; then module load autoPROC 2>/dev/null || true; fi
 cd "$PROCESS_DIR"
 # Prefer the trfrx venv (created by setup_env.sh): it carries matplotlib and
@@ -1439,63 +1764,64 @@ EOF
 chmod +x "$REPORT_JOB_SCRIPT"
 
 if [ "$STATS_ONLY" -eq 1 ]; then
-    # Sans limite, les fichiers portent les noms par défaut : on prévient avant
-    # d'écraser des rapports existants (p. ex. ceux copiés par trfrx_full_pipeline).
+    # Without a limit, the files take their default names: warn before
+    # overwriting existing reports (e.g. those copied by trfrx_full_pipeline).
     if [ -z "$MAX_IMAGE" ]; then
-        # NB : pas de `ls` ici — un glob sans correspondance renverrait un code
-        # non nul et `set -e`/`pipefail` tuerait le script silencieusement.
+        # NB: no `ls` here — a glob with no match would return a non-zero code
+        # and `set -e`/`pipefail` would kill the script silently.
         EXISTING=0
         for _f in "$PROCESS_DIR"/reports/*_report.pdf \
                   "$PROCESS_DIR"/reports/*_statistics.csv; do
             if [ -e "$_f" ]; then EXISTING=$((EXISTING + 1)); fi
         done
         if [ "$EXISTING" -gt 0 ]; then
-            echo "ATTENTION : $EXISTING fichier(s) de rapport existent déjà dans"
-            echo "            $PROCESS_DIR/reports et vont être ÉCRASÉS."
-            echo "            (une limite --max-image ajoute un suffixe _upto<N> et"
-            echo "             conserve les fichiers existants)"
-            printf "Continuer et écraser ? [o/N] : "
+            echo "WARNING: $EXISTING report file(s) already exist in"
+            echo "            $PROCESS_DIR/reports and will be OVERWRITTEN."
+            echo "            (a --max-image limit adds a _upto<N> suffix and"
+            echo "             keeps the existing files)"
+            printf "Continue and overwrite? [y/N]: "
             if ! read -r CONFIRM; then CONFIRM=""; echo; fi
             case "$(printf '%s' "$CONFIRM" | tr '[:upper:]' '[:lower:]')" in
-                o|oui|y|yes) : ;;
-                *) echo "Abandon (aucun fichier modifié)."; exit 0 ;;
+                y|yes) : ;;
+                *) echo "Aborted (no file modified)."; exit 0 ;;
             esac
         fi
     fi
-    # Rapports seuls : rien à attendre, on génère tout de suite (quelques secondes).
-    echo "Génération des rapports..."
+    # Reports only: nothing to wait for, generate right away (a few seconds).
+    echo "Generating reports..."
     bash "$REPORT_JOB_SCRIPT"
     echo ""
-    echo "Rapports dans : $PROCESS_DIR/reports"
+    echo "Reports in: $PROCESS_DIR/reports"
     if [ -n "$MAX_IMAGE" ]; then
-        echo "  (fichiers suffixés _upto${MAX_IMAGE} ; le rapport complet est conservé)"
+        echo "  (files suffixed _upto${MAX_IMAGE}; the full report is kept)"
     fi
     exit 0
 fi
 
-# NB : afterany (et non afterok) => le rapport est TOUJOURS généré une fois que
-# tous les chunks sont terminés, même si certains ont échoué (on aura alors
-# simplement des N/A pour ces chunks au lieu d'aucun rapport du tout).
+# NB: afterany (not afterok) => the report is ALWAYS generated once all chunks
+# have finished, even if some failed (in that case we simply get N/A for those
+# chunks instead of no report at all).
 DEP=$(IFS=:; echo "${CHUNK_JOBIDS[*]}")
 report_output=$(sbatch -p "$SLURM_PARTITION" -n 1 -c 1 --mem=8000 --dependency=afterany:"$DEP" "$REPORT_JOB_SCRIPT")
 REPORT_JOBID=$(echo "$report_output" | awk '{print $4}')
-echo "  [soumis] job $REPORT_JOBID : génération des rapports (dépend de $DEP)"
+echo "  [submitted] job $REPORT_JOBID: report generation (depends on $DEP)"
 
-# --- Récapitulatif de tous les jobs soumis ---
+# --- Summary of all submitted jobs ---
 echo ""
-echo "==================== Jobs soumis ===================="
+echo "==================== Submitted jobs ===================="
 printf "  %-12s %s\n" "JOB ID" "IMAGES"
 for idx in "${!CHUNK_JOBIDS[@]}"; do
     printf "  %-12s %s\n" "${CHUNK_JOBIDS[$idx]}" "${CHUNK_LABELS[$idx]}"
 done
-printf "  %-12s %s\n" "$REPORT_JOBID" "rapports finaux"
-echo "====================================================="
-echo "Total : $(( ${#CHUNK_JOBIDS[@]} + 1 )) jobs (${#CHUNK_JOBIDS[@]} traitements + 1 rapport)"
+printf "  %-12s %s\n" "$REPORT_JOBID" "final reports"
+echo "======================================================="
+echo "Total: $(( ${#CHUNK_JOBIDS[@]} + 1 )) jobs (${#CHUNK_JOBIDS[@]} processing + 1 report)"
 echo ""
-echo "Suivi : squeue -j $(IFS=,; echo "${CHUNK_JOBIDS[*]},$REPORT_JOBID")"
+echo "Track with: squeue -j $(IFS=,; echo "${CHUNK_JOBIDS[*]},$REPORT_JOBID")"
 echo ""
-echo "Traitements soumis. Résultats dans : $PROCESS_DIR"
-echo "Rapports finaux (générés après traitement) dans : $PROCESS_DIR/reports"
+echo "Processing submitted. Results in: $PROCESS_DIR"
+echo "Final reports (generated after processing) in: $PROCESS_DIR/reports"
 echo ""
-echo "Astuce : pour refaire seulement les statistiques (sans retraiter), lancez"
+echo "Tip: to regenerate only the reports + time_windows.csv (without reprocessing):"
 echo "         $0 --stats \"$OUTPUT_DIR\""
+echo "         (for real times, add --frame-time-ms MS or --images-dir/--image-template)"

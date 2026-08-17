@@ -24,9 +24,9 @@ Peak tables / images /  ./output_dfo/reports/  and  ./output_svd/reports/
 per-map PDFs and the    series recap live under the two output folders.
 
 Supported MTZ trailing-index patterns (from the source scripts):
-    _N.mtz          e.g. CaMDH_073_137_2.mtz
-    _start-end.mtz  e.g. CaMDH_073_275_1-250.mtz
-    _start_end.mtz  e.g. CaMDH_073_275_1_300.mtz
+    _N.mtz          e.g. SAMPLE_137_2.mtz
+    _start-end.mtz  e.g. SAMPLE_275_1-250.mtz
+    _start_end.mtz  e.g. SAMPLE_275_1_300.mtz
 
 Typical use (non-expert friendly — auto-detects ref MTZ, labels, res):
     ./trfrx_full_pipeline.py MODEL.pdb  /path/to/autoPROC_chunks  /path/to/output
@@ -115,9 +115,9 @@ SNR_TOP_N    = 5
 # "rising"/"decaying" rather than "flickering" (|Spearman rho| threshold).
 TREND_RHO = 0.6
 
-# CaMDH active-site residues used by the existing dFo PyMOL scripts — only used
-# as a convenience default if you later enable the active-site flag.
-DEFAULT_ACTIVE_SITE = [82, 88, 148, 151, 175]
+# Optional convenience default for the active-site flag: fill in your own
+# residue numbers of interest (empty by default — pass --active-site to use).
+DEFAULT_ACTIVE_SITE: list[int] = []
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -356,6 +356,22 @@ def collect_source_mtz(directory: Path) -> list[Path]:
     return [mtz for _, mtz in indexed]
 
 
+RWORK_WARN = 0.40   # model r_work above this vs a dataset => phases unreliable (mis-indexing)
+
+
+def _diffmap_rwork(log_path) -> list:
+    """The model r_work value(s) phenix printed in a diffmap log (empty if none)."""
+    out = []
+    try:
+        for line in Path(log_path).read_text(errors="ignore").splitlines():
+            m = re.search(r"r_work=\s*([0-9.]+)", line)
+            if m:
+                out.append(float(m.group(1)))
+    except OSError:
+        pass
+    return out
+
+
 def compute_diffmap(target, ref, model, labels, reslim, dry_run, out_dir, log_dir=None):
     """phenix.fobs_minus_fobs_map — reused verbatim from SVD_all_in_one.py.
 
@@ -403,8 +419,98 @@ def compute_diffmap(target, ref, model, labels, reslim, dry_run, out_dir, log_di
         except FileNotFoundError:
             raise RuntimeError("phenix.fobs_minus_fobs_map not found in PATH.")
 
+    # Safety gate: if the phase model does not fit this data (high r_work) the diff-map
+    # phases are unreliable — almost always an indexing/placement mismatch between the
+    # model and the timepoint data. Warn loudly so bad maps are never trusted silently.
+    rws = _diffmap_rwork(log_path)
+    if rws and max(rws) > RWORK_WARN:
+        print(f"  ⚠ WARNING: model r_work={max(rws):.2f} against this data — diff-map "
+              f"phases are UNRELIABLE (expected ~0.15–0.25). Likely an indexing/placement "
+              f"mismatch; this dFo map may be meaningless. See {log_path.name}.")
     print(f"  MTZ: {prefix}_1.mtz")
     print(f"  LOG: {log_path.name}")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# § C0. time_windows.csv consumer — real per-dataset acquisition time.
+#      Produced by TR-FRX_autoPROC.sh (reports/time_windows.csv). This module
+#      only READS it (never re-reads image headers): the SVD x-axis and the
+#      series recap use the real t_end_s (END of each window — the TR-FRX
+#      timepoint convention) when the CSV is present, else fall back to the
+#      synthetic --time-step.
+# ═════════════════════════════════════════════════════════════════════════
+_DSNO_RE = re.compile(r"\d+")
+
+
+def _dataset_no_from_name(name: str):
+    """Dataset number = second-to-last integer in a dFo map name (matches run_svd)."""
+    ints = _DSNO_RE.findall(name)
+    return int(ints[-2]) if len(ints) >= 2 else None
+
+
+def load_time_windows(path) -> list:
+    """Read a time_windows.csv into a list of dict rows (stdlib csv). [] on error."""
+    import csv as _csv
+    try:
+        with open(path, newline="") as fh:
+            return list(_csv.DictReader(fh))
+    except OSError:
+        return []
+
+
+def resolve_time_windows_path(dfo_dir, explicit=None):
+    """Locate time_windows.csv: explicit path, else <dfo_dir>/time_windows.csv,
+    else the sibling autoproc_chunks/reports/time_windows.csv. None if absent."""
+    dfo_dir = Path(dfo_dir)
+    cands = ([Path(explicit)] if explicit else []) + [
+        dfo_dir / "time_windows.csv",
+        dfo_dir.parent / "autoproc_chunks" / "reports" / "time_windows.csv",
+    ]
+    for c in cands:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            pass
+    return None
+
+
+def time_point_by_dataset(tw_rows: list, ns: list):
+    """Map each dataset number in *ns* to its timepoint = t_end_s (seconds), i.e.
+    the time at the END of its image window (the TR-FRX convention: reference
+    dataset = 0 s, each later chunk = time at its last image).
+
+    Join strategy: first by key (a row's dataset_id or image_first equals n); if
+    that leaves any n unresolved, fall back to an ordinal join (i-th dataset by
+    number ↔ i-th window by t_end) but ONLY when the counts match. Returns
+    (dict n→seconds, how) where how is 'key' | 'order' | '' (unusable)."""
+    def tend(r):
+        try:
+            return float(r.get("t_end_s"))
+        except (TypeError, ValueError):
+            return None
+    good = [(r, tend(r)) for r in tw_rows]
+    good = [(r, t) for r, t in good if t is not None]
+    if not good or not ns:
+        return {}, ""
+    by_key = {}
+    for r, t in good:
+        for k in (r.get("dataset_id"), r.get("image_first")):
+            if k in (None, ""):
+                continue
+            by_key[str(k)] = t
+            try:
+                by_key[int(k)] = t
+            except (TypeError, ValueError):
+                pass
+    matched = {n: by_key.get(n, by_key.get(str(n))) for n in ns}
+    if all(v is not None for v in matched.values()):
+        return matched, "key"
+    if len(good) == len(ns):
+        ts = sorted(t for _r, t in good)
+        order = sorted(range(len(ns)), key=lambda i: ns[i])
+        return {ns[i]: ts[rank] for rank, i in enumerate(order)}, "order"
+    return {}, ""
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -413,7 +519,8 @@ def compute_diffmap(target, ref, model, labels, reslim, dry_run, out_dir, log_di
 #      Existing outputs (maps, rSV.csv, plot) are unchanged.
 # ═════════════════════════════════════════════════════════════════════════
 def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None,
-            common_dmin: float | None = None, exclude_stems: set | None = None):
+            common_dmin: float | None = None, exclude_stems: set | None = None,
+            time_windows_path=None):
     """Scan dfo_dir for dFo_*.mtz, run SVD, write maps/csv/plot. Returns [S].
 
     Unbiased-SVD controls (Feature 2):
@@ -521,14 +628,36 @@ def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None,
         return None
 
     step    = time_step_ms
-    x_label = f"Time (ms), step={step} ms" if step is not None else "Dataset"
-    print(f"  SVD: X axis = {x_label}, {len(entries)} maps")
+    ns      = [e[0] for e in entries]
 
+    # Real acquisition time (seconds) from time_windows.csv takes precedence over
+    # the synthetic --time-step. Falls back cleanly when the CSV is absent/unusable.
+    sec_by_n, how = ({}, "")
+    if time_windows_path:
+        sec_by_n, how = time_point_by_dataset(load_time_windows(time_windows_path), ns)
+    use_seconds = bool(sec_by_n)
+    if use_seconds:
+        unit    = "s"
+        x_of    = lambda n: sec_by_n[n]
+        x_label = "Time (s)"
+        print(f"  SVD: X axis = real time (s) from {Path(time_windows_path).name} "
+              f"(matched by {how}), {len(entries)} maps")
+    elif step is not None:
+        unit    = "ms"
+        x_of    = lambda n: (n - 1) * step
+        x_label = f"Time (ms), step={step} ms"
+        print(f"  SVD: X axis = {x_label}, {len(entries)} maps")
+    else:
+        unit    = None
+        x_of    = lambda n: n - 1
+        x_label = "Dataset"
+        print(f"  SVD: X axis = {x_label}, {len(entries)} maps")
+
+    fit_unit = unit or "ms"
     df = pd.DataFrame({
-        "n":       [e[0] for e in entries],
-        "x_num":   [float(e[0] - 1) if step is None else float((e[0] - 1) * step)
-                    for e in entries],
-        "x_label": [e[1].stem if step is None else f"{(e[0]-1)*step} ms"
+        "n":       ns,
+        "x_num":   [float(x_of(e[0])) for e in entries],
+        "x_label": [(f"{x_of(e[0]):.4g} {unit}" if unit else e[1].stem)
                     for e in entries],
         "path":    [e[1] for e in entries],
     }).sort_values("n").reset_index(drop=True)
@@ -572,7 +701,7 @@ def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None,
     t_index   = np.array(df.x_num, dtype=float)
     x_labels  = list(df.x_label)
     scaled_tf = (sigmat @ VT)[:n_files, :]
-    index_label = "time_ms" if step is not None else "dataset"
+    index_label = {"s": "time_s", "ms": "time_ms"}.get(unit, "dataset")
     pd.DataFrame({f"rSV{i}": scaled_tf[i] for i in range(n_files)},
                  index=x_labels).to_csv(out_dir / "rSV.csv", index_label=index_label)
 
@@ -612,7 +741,8 @@ def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None,
         yi = np.array(scaled_tf[i], dtype=float)[order]
         ax.plot(range(len(t)), yi, "o--", color=palette[i],
                 markersize=8, linewidth=2, alpha=0.7, label=f"SV{i}")
-        if i == 0 and DO_FIT_SV0 and HAVE_SCIPY and step is not None and len(t) >= 4:
+        if i == 0 and DO_FIT_SV0 and HAVE_SCIPY and (use_seconds or step is not None) \
+                and len(t) >= 4:
             try:
                 C0   = float(np.mean(yi[-max(1, len(yi) // 10):]))
                 A0   = float(yi[0] - C0) if FIT_MODEL == "decay" else float(yi[-1] - C0)
@@ -623,10 +753,13 @@ def run_svd(dfo_dir: Path, out_dir: Path, time_step_ms: float | None = None,
                 tfit = np.linspace(float(t.min()), float(t.max()), 300)
                 xfit = np.interp(tfit, t, range(len(t)))
                 ax.plot(xfit, monoexp(tfit, *popt), "-", color=palette[0],
-                        linewidth=2.5, alpha=0.95, label=f"SV0 fit (tau={popt[1]:.2f} ms)")
+                        linewidth=2.5, alpha=0.95,
+                        label=f"SV0 fit (tau={popt[1]:.2f} {fit_unit})")
                 with open(out_dir / "SV0_monoexp_fit.txt", "w") as f:
-                    f.write(f"model {FIT_MODEL}\nA {popt[0]}\ntau_ms {popt[1]}\nC {popt[2]}\n")
-                print(f"  SVD: SV0 fit -> A={popt[0]:.4g}, tau={popt[1]:.4g} ms, C={popt[2]:.4g}")
+                    f.write(f"model {FIT_MODEL}\nA {popt[0]}\n"
+                            f"tau_{fit_unit} {popt[1]}\nC {popt[2]}\n")
+                print(f"  SVD: SV0 fit -> A={popt[0]:.4g}, "
+                      f"tau={popt[1]:.4g} {fit_unit}, C={popt[2]:.4g}")
             except Exception as e:
                 print(f"  SVD: SV0 fit failed ({e})")
 
@@ -1863,7 +1996,8 @@ def map_quality_verdict(r: dict) -> str:
 
 
 def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
-                       radius: float, svd_info: dict | None = None) -> None:
+                       radius: float, svd_info: dict | None = None,
+                       time_by_name: dict | None = None) -> None:
     """
     One higher-level file across the whole series so you don't open every PDF.
     Contains: best peak + S/N per timepoint, SV weights, persistent-site table
@@ -1888,9 +2022,11 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
             return None
 
     # Per-timepoint summary CSV — plain-language headers, rounded (A3/A4)
+    time_by_name = time_by_name or {}
     csv_path = recap_path.with_suffix(".csv")
     pd.DataFrame([{
         "timepoint": r["name"],
+        "time (s)": _r(time_by_name.get(r["name"]), 3),
         "peaks found": r["n_peaks"],
         "strongest peak (sigma)": _r(r["best_sigma"], 2),
         "strongest peak near": r["best_res"],
@@ -2007,14 +2143,18 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
                         fontsize=8, family="monospace"); y -= 0.020
             y -= 0.012
 
-        ax.text(0.05, y, "Best peak per timepoint  (map: best-sigma @ res | S/N)",
-                fontsize=12, weight="bold"); y -= 0.028
+        _has_time = any(time_by_name.get(r["name"]) is not None for r in dfo_results)
+        _thdr = "  (t: real acquisition time)" if _has_time else ""
+        ax.text(0.05, y, "Best peak per timepoint  (map: best-sigma @ res | S/N)"
+                + _thdr, fontsize=12, weight="bold"); y -= 0.028
         for r in dfo_results:
             mark = " *AS*" if r.get("active_flag") else ""
             snr = r.get("snr", float("nan"))
+            _tv = time_by_name.get(r["name"])
+            _ts = f" | t {_tv:6.2f}s" if _tv is not None else ""
             ax.text(0.06, y, f"{r['name'][:34]:<36} {r['best_sigma']:+5.1f}s @ "
                              f"{r['best_res']:<6} | S/N {snr:4.1f} "
-                             f"({r['n_peaks']}pk){mark}",
+                             f"({r['n_peaks']}pk){_ts}{mark}",
                     fontsize=7.5, family="monospace"); y -= 0.020
 
         y -= 0.02
@@ -2155,6 +2295,8 @@ def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
               f"--radius {args.radius} --n-peaks {args.n_peaks}")
     if args.time_step is not None:
         common += f" --time-step {args.time_step}"   # SVD x-axis in ms + SV0 tau fit
+    if getattr(args, "time_windows", None):
+        common += f" --time-windows {args.time_windows}"   # real per-dataset time
     if args.skip_images:
         common += " --skip-images"
     if args.active_site:
@@ -2249,7 +2391,12 @@ def _legacy_pipeline_parser() -> argparse.ArgumentParser:
                         help="Fixed high-res cutoff for ALL maps "
                              "(default: interactive / worst-common).")
     parser.add_argument("--time-step", type=float, default=None, metavar="MS",
-                        help="Time interval in ms between datasets (SVD X-axis).")
+                        help="Time interval in ms between datasets (SVD X-axis "
+                             "fallback; real time_windows.csv is used when present).")
+    parser.add_argument("--time-windows", default=None, metavar="CSV",
+                        help="Path to time_windows.csv (real per-dataset time). "
+                             "Default: auto-detect next to the dFo maps or in the "
+                             "autoproc_chunks report.")
     parser.add_argument("--skip-svd",  action="store_true", help="Diffmaps only.")
     parser.add_argument("--dry-run",   action="store_true",
                         help="Print the plan without running anything.")
@@ -2507,9 +2654,26 @@ def _run_svd_and_peaks(out_dfo: Path, out_svd: Path, model: Path, args,
         print(f"  SVD: common cutoff {common_dmin:.3f} A"
               + (f", excluding {len(exclude_stems)} resolution outlier(s)"
                  if exclude_stems else ""))
+
+    # Real per-dataset time: locate time_windows.csv (explicit override, else next
+    # to the dFo maps, else the autoproc_chunks report) and copy it beside the maps
+    # so downstream tools find it in one place.
+    tw_path = resolve_time_windows_path(out_dfo, getattr(args, "time_windows", None))
+    if tw_path is not None and tw_path.parent != out_dfo:
+        try:
+            import shutil
+            shutil.copy2(tw_path, out_dfo / "time_windows.csv")
+            tw_path = out_dfo / "time_windows.csv"
+            print(f"  time: copied {tw_path.name} into {out_dfo}")
+        except OSError as e:
+            print(f"  time: could not copy time_windows.csv ({e}); using in place")
+    if tw_path is not None:
+        print(f"  time: using {tw_path}")
+
     try:
         sv_values = run_svd(out_dfo, out_svd, args.time_step,
-                            common_dmin=common_dmin, exclude_stems=exclude_stems)
+                            common_dmin=common_dmin, exclude_stems=exclude_stems,
+                            time_windows_path=tw_path)
     except Exception as e:
         print(f"SVD ERROR: {e}")
         return 2
@@ -2525,10 +2689,21 @@ def _run_svd_and_peaks(out_dfo: Path, out_svd: Path, model: Path, args,
     # path those aren't in memory, so rebuild them from the existing dFo maps.
     if dfo_results is None:
         dfo_results = _recap_from_existing(out_dfo, st, model, args, merge_radius)
+
+    # Real time per timepoint for the recap (same join as the SVD x-axis).
+    time_by_name = {}
+    if tw_path is not None and dfo_results:
+        names = [r["name"] for r in dfo_results]
+        ns    = [_dataset_no_from_name(nm) for nm in names]
+        sec_map, _how = time_point_by_dataset(load_time_windows(tw_path),
+                                              [n for n in ns if n is not None])
+        time_by_name = {nm: sec_map[n] for nm, n in zip(names, ns)
+                        if n is not None and n in sec_map}
+
     if dfo_results:
         build_series_recap(dfo_results, sv_values,
                            out_svd / "series_recap.pdf", args.radius,
-                           svd_info=_svd_scope_info(args))
+                           svd_info=_svd_scope_info(args), time_by_name=time_by_name)
     return 0
 
 
@@ -2838,6 +3013,65 @@ def clean_all_timepoints(copied_root: Path, dfo_dir: Path, base_name: str,
     if written == 0:
         raise RuntimeError("No MTZ files were cleaned — cannot continue.")
     return written
+
+
+def parse_dimple_reindex(dimple_log: Path) -> "str | None":
+    """The reindex operator dimple applied to match the model (e.g. '-h,-k,l'), or
+    None if it kept the original indexing.
+
+    dimple.log records e.g.:
+      alt_reindex: [{"op": "[-h,-k,l]", "cc": 0.882, ...}, {"op": "[h,k,l]", "cc": 0.034, ...}]
+    dimple applies the highest-CC operator; we return that (identity -> None) so the
+    caller can bring the timepoint data into the SAME indexing as the placed model."""
+    if not dimple_log.is_file():
+        return None
+    import json
+    for line in dimple_log.read_text(errors="ignore").splitlines():
+        s = line.strip()
+        if s.startswith("alt_reindex:"):
+            try:
+                arr = json.loads(s.split("alt_reindex:", 1)[1].strip())
+            except Exception:
+                return None
+            if not arr:
+                return None
+            best = max(arr, key=lambda d: d.get("cc", -1))
+            op = str(best.get("op", "")).strip().strip("[]").replace(" ", "")
+            return None if (not op or op.lower() == "h,k,l") else op
+    return None
+
+
+def reindex_mtz(mtz_path: Path, op: str, dry_run: bool = False) -> bool:
+    """Reindex an MTZ in place by *op* (e.g. '-h,-k,l'). Tries gemmi, then CCP4
+    `reindex`. Amplitude data only need the hkl transformed and re-mapped to the ASU,
+    which both handle. Returns True on success."""
+    if dry_run:
+        print(f"  [dry-run] would reindex {mtz_path.name} by [{op}]")
+        return True
+    try:
+        import gemmi
+        triplet = op.lower().replace("h", "x").replace("k", "y").replace("l", "z")
+        m = gemmi.read_mtz_file(str(mtz_path))
+        m.reindex(gemmi.Op(triplet))          # relabel hkl by the operator
+        m.ensure_asu()                        # re-reduce to the standard ASU (matches dimple)
+        m.write_to_file(str(mtz_path))
+        return True
+    except Exception:
+        pass
+    if shutil.which("reindex"):
+        tmp = mtz_path.with_suffix(".reidx.mtz")
+        try:
+            cp = subprocess.run(["reindex", "hklin", str(mtz_path), "hklout", str(tmp)],
+                                input=f"REINDEX {op}\nEND\n", text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if cp.returncode == 0 and tmp.is_file():
+                tmp.replace(mtz_path)
+                return True
+        except OSError:
+            pass
+        if tmp.exists():
+            tmp.unlink()
+    return False
 
 
 def parse_dimple_r(dimple_log: Path):
@@ -3341,7 +3575,11 @@ def main() -> int:
                         help=f"Show residues within this many A of the peak "
                              f"(default {DISPLAY_NEAR}).")
     parser.add_argument("--time-step", type=float, default=None, metavar="MS",
-                        help="Time interval in ms between datasets (SVD X-axis).")
+                        help="Time interval in ms between datasets (SVD X-axis "
+                             "fallback; real time_windows.csv is used when present).")
+    parser.add_argument("--time-windows", default=None, metavar="CSV",
+                        help="Path to time_windows.csv (real per-dataset time; "
+                             "auto-detected when omitted).")
     parser.add_argument("--high-res", type=float, default=None, metavar="A",
                         help="Fixed high-res cutoff for ALL maps (else interactive).")
     parser.add_argument("--skip-images", action="store_true",
@@ -3423,6 +3661,7 @@ def main() -> int:
             "ref_timepoint": args.ref_timepoint or "(first)",
             "sigma": args.sigma, "radius": args.radius, "n_peaks": args.n_peaks,
             "high_res": args.high_res, "time_step": args.time_step,
+            "time_windows": args.time_windows or "(auto-detect)",
             "cad": shutil.which(CAD_EXE), "dimple": shutil.which(DIMPLE_EXE),
             "phenix": shutil.which("phenix.fobs_minus_fobs_map"),
         })
@@ -3516,6 +3755,32 @@ def main() -> int:
             print(f"  WARNING: {analysis / 'final.pdb'} not found; using provided model.")
             model_for_pipeline = user_model
 
+        # ---- Stage 3b: match the timepoint data to the model's indexing ----
+        # dimple may REINDEX the data (e.g. the P3(1)21 alt-indexing [-h,-k,l]) so the raw
+        # autoPROC setting matches the model, then refine final.pdb in THAT frame. The
+        # Stage-2 cleaned timepoint MTZs are still in the ORIGINAL indexing, so pairing
+        # them with the reindexed model gives r_work ~0.5 and garbage diff-map phases.
+        # Apply dimple's operator to every cleaned MTZ so model and data agree.
+        if not args.skip_dimple and start <= 3 <= stop and not args.dry_run:
+            op = parse_dimple_reindex(dimple_dir / "dimple.log")
+            marker = analysis / ".reindex_applied"
+            done = marker.read_text().strip() if marker.is_file() else ""
+            if op and done != op:
+                mtzs = sorted(analysis.glob(f"{name}_*.mtz"))
+                print(f"\n── Stage 3b: reindex {len(mtzs)} timepoint MTZ(s) to model "
+                      f"indexing [{op}] (dimple placed the model there) ──")
+                ok = sum(reindex_mtz(mz, op) for mz in mtzs)
+                if ok < len(mtzs):
+                    print(f"  WARNING: reindexed only {ok}/{len(mtzs)}; "
+                          f"check that gemmi.reindex or CCP4 'reindex' is available.")
+                else:
+                    print(f"  reindexed {ok}/{len(mtzs)} MTZ(s) -> [{op}].")
+                marker.write_text(op)
+            elif op and done == op:
+                print(f"\n(skip Stage 3b — timepoint MTZs already reindexed [{op}])")
+            else:
+                print("\n(Stage 3b: no reindex needed — model already matches data indexing)")
+
         if not (start <= 4 <= stop):
             print("\n(stopping before Stage 4 analysis, as requested)")
             if logf:
@@ -3539,6 +3804,7 @@ def main() -> int:
     pargs.display_sigma = args.display_sigma
     pargs.display_near  = args.display_near
     pargs.time_step     = args.time_step
+    pargs.time_windows  = args.time_windows
     pargs.high_res      = args.high_res
     pargs.skip_images   = args.skip_images
     pargs.skip_svd      = args.skip_svd
