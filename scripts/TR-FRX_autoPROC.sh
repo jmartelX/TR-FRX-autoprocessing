@@ -52,6 +52,10 @@ REF_FIRST_IMG=1
 REF_LAST_IMG=300
 CHUNK_SIZE=300
 
+# Space group and unit cell — EDIT these to match your crystal (example values).
+SYMM="I41"
+CELL="114 114 118 90 90 90"
+
 # --- Real per-dataset acquisition time -------------------------------------
 # The report computes a true time window [t_start, t_end] for every dataset and
 # writes reports/time_windows.csv. Leave FRAME_TIME_MS / OSC_PER_IMAGE blank to
@@ -67,10 +71,6 @@ FRAME_TIME_MS=""      # per-image frame period in ms (incl. dead time)
 OSC_PER_IMAGE=""      # oscillation per image in degrees
 T0_IMAGE=""           # blank = end of reference chunk (t0=0 there); or a trigger image index
 T0_SECONDS=0          # absolute seconds assigned to T0_IMAGE
-
-# Space group and unit cell — EDIT these to match your crystal (example values).
-SYMM="I41"
-CELL="114 114 118 90 90 90"
 
 # SLURM partition — EDIT to match your cluster.
 SLURM_PARTITION="nice"
