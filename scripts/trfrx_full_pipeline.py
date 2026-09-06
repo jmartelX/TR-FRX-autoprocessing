@@ -2075,7 +2075,6 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
             cell_text = []
             _f = lambda v, n=2: (f"{v:.{n}f}" if isinstance(v, (int, float)) and v == v else "-")
             for r in dfo_results:
-                iso = r.get("iso", {})
                 sc  = r.get("scaling") or {}
                 in_svd = ("yes" if r.get("in_svd") else
                           ("NO" if r.get("in_svd") is False else "-"))
@@ -2270,7 +2269,7 @@ def analyze_map(map_mtz: Path, st, model_path: Path, sigma,
 def submit_cluster(work_dir: Path, mtz_files: list[Path], ref: Path,
                    reslim: float, args) -> int:
     """
-    Submit the series to SLURM, reusing the TR-FRX_autoPROC_cbf.sh pattern:
+    Submit the series to SLURM, reusing the TR-FRX_autoPROC.sh pattern:
     one job per source MTZ (diffmap + peak analysis), then a final SVD+recap
     job chained with --dependency=afterany (so a failed timepoint still yields a
     report from the maps that succeeded).
@@ -2743,6 +2742,12 @@ def _recap_from_existing(out_dfo: Path, st, model: Path, args,
 # ═════════════════════════════════════════════════════════════════════════
 SUBFOLDER_PREFIX = "autoPROC_"
 
+# Only a bare autoPROC_<first>_<last> is a real chunk. TR-FRX_autoPROC.sh's QC
+# pass renames a superseded chunk to autoPROC_<first>_<last>.qc_orig_backup, and
+# a plain startswith() matches that too — copying the pre-QC data and adding it
+# to the timepoint series as a phantom duplicate of the window it replaced.
+CHUNK_DIR_RE = re.compile(r"^autoPROC_(\d+)_(\d+)$")
+
 # Files copied verbatim from every autoPROC_* chunk (copy_files.py default set).
 DEFAULT_COPY_FILES = [
     "staraniso_alldata-unique.mtz",
@@ -2816,9 +2821,16 @@ def copy_chunks(source: Path, dest_root: Path, files_to_copy: list,
         dest_root.mkdir(parents=True, exist_ok=True)
 
     subfolders = sorted(p for p in source.iterdir()
-                        if p.is_dir() and p.name.startswith(SUBFOLDER_PREFIX))
+                        if p.is_dir() and CHUNK_DIR_RE.match(p.name))
     if not subfolders:
-        raise RuntimeError(f"No '{SUBFOLDER_PREFIX}*' subfolders found in {source}")
+        raise RuntimeError(f"No '{SUBFOLDER_PREFIX}<first>_<last>' chunks found in {source}")
+
+    skipped_dirs = sorted(p.name for p in source.iterdir()
+                          if p.is_dir() and p.name.startswith(SUBFOLDER_PREFIX)
+                          and not CHUNK_DIR_RE.match(p.name))
+    if skipped_dirs:
+        print(f"  Skipping {len(skipped_dirs)} non-chunk {SUBFOLDER_PREFIX}* folder(s): "
+              f"{', '.join(skipped_dirs)}")
 
     results, failures = [], []
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -2839,19 +2851,25 @@ def copy_chunks(source: Path, dest_root: Path, files_to_copy: list,
     for f in failures:
         print(f"  FAILED {f}")
 
-    # Also bring over the autoPROC damage reports (autoproc_chunks/reports/,
-    # produced by TR-FRX_autoPROC.sh) so they live alongside the copied chunks.
-    src_reports = source / "reports"
-    dst_reports = dest_root / "reports"
-    if src_reports.is_dir():
+    # Also bring over the autoPROC damage reports (autoproc_chunks/reports/) and
+    # the QC provenance (autoproc_chunks/reports_qc/ — qc_fixed.tsv and
+    # reindex_standalone.tsv), both produced by TR-FRX_autoPROC.sh, so they live
+    # alongside the copied chunks. The QC files are what document which windows
+    # were reprocessed with fewer images or reindexed standalone; without them the
+    # shaded bands in the damage-report PDFs have no explanation.
+    for rname in ("reports", "reports_qc"):
+        src_reports = source / rname
+        dst_reports = dest_root / rname
+        if not src_reports.is_dir():
+            continue
         if dry_run:
-            print(f"  [dry-run] would copy reports/ -> {dst_reports}")
+            print(f"  [dry-run] would copy {rname}/ -> {dst_reports}")
         elif resume and dst_reports.is_dir():
-            print("  reports/ already present (skipped)")
+            print(f"  {rname}/ already present (skipped)")
         else:
             shutil.copytree(src_reports, dst_reports, dirs_exist_ok=True)
             n = sum(1 for p in dst_reports.rglob("*") if p.is_file())
-            print(f"  reports/: copied {n} file(s) -> {dst_reports}")
+            print(f"  {rname}/: copied {n} file(s) -> {dst_reports}")
     return dest_root
 
 
@@ -2888,7 +2906,7 @@ def find_target_mtz(folder: Path, target_name: str):
     """Locate *target_name* in the folder's autoPROC_* chunk with the lowest index
     (fetch_clean_mtz.py.find_mtz_in_folder, parametrised by the file name)."""
     autoproc = [d for d in folder.iterdir()
-                if d.is_dir() and d.name.startswith(SUBFOLDER_PREFIX)]
+                if d.is_dir() and CHUNK_DIR_RE.match(d.name)]
     candidates = []
     for ap in autoproc:
         mtz = ap / target_name
@@ -3313,7 +3331,7 @@ def validate_reference_mtz(raw_mtz: Path) -> None:
 def source_timepoints(chunks: Path) -> list:
     """[(label, chunk_dir), ...] from the SOURCE autoPROC_* chunks, in order."""
     dirs = sorted(p for p in chunks.iterdir()
-                  if p.is_dir() and p.name.startswith(SUBFOLDER_PREFIX))
+                  if p.is_dir() and CHUNK_DIR_RE.match(p.name))
     tps = []
     for d in dirs:
         r = d.name[len(SUBFOLDER_PREFIX):]

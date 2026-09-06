@@ -1,5 +1,5 @@
 # ============================================================
-# setup_env.sh — prepare the environment for trfrx_pipeline.py
+# setup_env.sh — prepare the environment for the TR-FRX scripts
 #
 # SOURCE this file (do not execute it), so the environment stays
 # active in your current shell:
@@ -14,7 +14,7 @@
 #                                            dependencies, and activates it.
 #
 # After sourcing, run any of the linked scripts in the same shell, e.g.:
-#     python /path/to/trfrx_pipeline.py --dry-run
+#     python /path/to/trfrx_full_pipeline.py --dry-run
 #
 # Edit MODULES below if a tool has a different name on a given machine.
 # ============================================================

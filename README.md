@@ -56,12 +56,13 @@ docstring at the top of the file.
 |---|---|---|
 | [autoPROC](https://www.globalphasing.com/autoproc/) | step 0 | `process` |
 | SLURM | step 0, `--cluster` | `sbatch`, `srun` |
-| [CCP4](https://www.ccp4.ac.uk/) | clean + dimple | `cad`, `mtzdmp`, `dimple` |
+| [CCP4](https://www.ccp4.ac.uk/) | clean + dimple + reindex | `cad`, `mtzdmp`, `dimple`, `pointless` |
 | [PHENIX](https://phenix-online.org/) | difference maps | `phenix.fobs_minus_fobs_map` |
 | [PyMOL](https://pymol.org/) | peak figures | `pymol` |
 
 **Python ≥ 3.10**, with: `numpy`, `pandas`, `scipy`, `gemmi`, `matplotlib`,
-`seaborn`, `dask`.
+`seaborn`, `dask`, `h5py` (Eiger header reading). `setup_env.sh` installs all
+of them.
 
 ### Environment setup
 
@@ -106,6 +107,8 @@ are documented in the script header):
 | `CELL` | Unit-cell parameters (edit for your crystal) | `114 114 118 90 90 90` |
 | `SLURM_PARTITION` | SLURM partition | `nice` |
 | `SLURM_CPUS` / `SLURM_MEM` | Resources per job | `24` / `24000` |
+| `FRAME_TIME_MS` / `OSC_PER_IMAGE` | Frame period (ms) / oscillation (°); blank = read from the image header | `` / `` |
+| `T0_IMAGE` / `T0_SECONDS` | Time origin; blank `T0_IMAGE` = t = 0 at the end of the reference chunk | `` / `0` |
 
 Then:
 
@@ -134,7 +137,47 @@ autoproc_chunks/
     autoPROC_601_900/
     ...
     reports/              ← consolidated STARANISO / truncate statistics
+    reports_qc/           ← QC provenance (qc_fixed.tsv, reindex_standalone.tsv)
 ```
+
+`reports/` also holds `time_windows.csv`, the real per-dataset acquisition time
+that Step 1+ uses for the SVD time axis.
+
+#### Automatic recovery and QC
+
+Two things happen without you asking:
+
+- **Failed `-ref` scaling.** If a chunk fails to scale against the reference
+  (typically non-isomorphous drift on an otherwise good window) it is retried
+  **standalone**, then reindexed onto the reference with CCP4 `pointless` so the
+  Fo−Fo subtraction stays valid. Such windows are listed in
+  `reports_qc/reindex_standalone.tsv` and hatched blue in the report PDFs.
+- **Outlier `Rmerge`.** Once every chunk has finished, a QC job re-runs any
+  window whose overall `Rmerge` is an outlier, excluding dead leading frames and
+  keeping the trim with the lowest `Rmerge` at acceptable completeness. The
+  superseded run is kept as `autoPROC_<first>_<last>.qc_orig_backup`, the change
+  is recorded in `reports_qc/qc_fixed.tsv`, and the window is shaded amber in the
+  report PDFs. Tune with the `QC_*` variables; `QC_ENABLE=0` turns it off.
+
+The QC pass verifies its own effect: it compares the number of images used in
+the merge before and after each trim, and rejects a trim that did not actually
+reduce it (which would mean `EXCLUDE_DATA_RANGE` had no effect in your autoPROC
+build). If the count cannot be parsed the trim is still accepted, but
+`reports_qc/qc_refix.log` records the exclusion as unverified.
+
+> [!NOTE]
+> `.qc_orig_backup` folders are deliberately **skipped** by Step 1+ — they hold
+> superseded pre-QC data. The pipeline prints what it skipped.
+
+#### Regenerating the reports only
+
+```bash
+./TR-FRX_autoPROC.sh --stats /data/processed/SAMPLE
+```
+
+Add `--max-image N` to keep only chunks ending at or before image `N` (a chunk
+straddling `N` is excluded, never truncated); those reports get an `_upto<N>`
+suffix so the full-series report is never overwritten.
 
 > [!CAUTION]
 > **Wait for all jobs to finish before continuing.**
@@ -166,6 +209,8 @@ It asks for a **dataset name** and whether to use the **staraniso** or
 ```
 /data/processed/SAMPLE/
     autoproc_copy/                  # copied chunks (created once)
+        reports/                    # statistics, damage PDFs, time_windows.csv
+        reports_qc/                 # QC provenance, carried over with the chunks
     run_01/
         analysis/                   # cleaned MTZ, final.pdb, output_dfo/, output_svd/
         dimple/                     # dimple run + its logs
