@@ -351,12 +351,12 @@ if process -Id "$RUN_ID,$IMAGES_DIR,$IMAGE_TEMPLATE,$i,$j" -ref "\$REF" AutoProc
 fi
 
 # --- Option-A fallback: the -ref scaling failed (typically non-isomorphous drift on a
-#     GOOD window). Retry STANDALONE (own cell), then re-lock the index frame to the
+#     GOOD window). Retry STANDALONE, then re-lock the index frame to the
 #     reference so the Fo-Fo subtraction stays valid: space groups with an indexing
 #     ambiguity (e.g. h,k,l vs -h,-k,l) need this, and -ref normally resolves it. ---
 echo "WARNING: -ref processing failed for images $i-$j; retrying standalone ..." >&2
 rm -rf "$OUTDIR"
-if ! process -Id "$RUN_ID,$IMAGES_DIR,$IMAGE_TEMPLATE,$i,$j" symm="$SYMM" AutoProcScale_RunStaraniso=yes -d "$OUTDIR"; then
+if ! process -Id "$RUN_ID,$IMAGES_DIR,$IMAGE_TEMPLATE,$i,$j" symm="$SYMM" cell="$CELL" AutoProcScale_RunStaraniso=yes -d "$OUTDIR"; then
     echo "ERROR: standalone processing also failed for images $i-$j" >&2
     exit 2
 fi
@@ -394,10 +394,22 @@ done
 # QCFIX: automatic quality-gated retry for OUTLIER windows.
 # Keeps every chunk/time-window definition unchanged (same -Id first,last,
 # same autoPROC_<i>_<j> name, same t_end -> same time point). For a window
-# whose overall Rmerge is an outlier, it re-runs autoPROC on the SAME window
+# whose overall Rmeas is an outlier, it re-runs autoPROC on the SAME window
 # but excludes a block of dead LEADING frames via XDS EXCLUDE_DATA_RANGE
-# (this is what an older autoPROC did automatically), scanning a few trims
-# and keeping the one with the lowest Rmerge at acceptable completeness.
+# (this is what an older autoPROC did automatically), scanning a few trims and
+# keeping the SMALLEST one that brings the window back under the threshold.
+#
+# The metric is Rmeas, not Rmerge: Rmerge falls as multiplicity falls, so
+# selecting on it rewards discarding data -- every further trim "improves" it
+# even when the surviving data is no better. Rmeas is multiplicity-corrected.
+# Among the trims that fix the window, the one with the lowest Rpim wins. Rpim is
+# the precision of the MERGED intensities -- the data the difference maps are
+# built from -- and unlike Rmeas it has a real optimum: trim too little and bad
+# frames poison the mean, trim too much and the lost multiplicity makes it worse.
+# So Rmeas decides WHICH windows need fixing (it compares fairly across windows of
+# different multiplicity) and Rpim decides HOW MUCH to trim. A larger trim
+# displaces a smaller accepted one only for a gain of at least QC_MIN_GAIN, so a
+# 1-5% drift never costs a third of the window's images.
 # Runs as one SLURM job after all chunks; the report/time_windows job then
 # depends on it so it reads the fixed chunk.
 #
@@ -409,10 +421,14 @@ done
 # records that the exclusion was unverified -- check reports_qc/qc_refix.log.
 # =====================================================================
 QC_ENABLE=${QC_ENABLE:-1}
-QC_RMERGE_ABS=${QC_RMERGE_ABS:-1.5}       # flag a window if overall Rmerge > this ...
-QC_RMERGE_FACTOR=${QC_RMERGE_FACTOR:-3}   # ... or > FACTOR x median(all windows)
+# NB: these two now gate on Rmeas, not Rmerge (see the note above). The names are
+# kept so existing QC_RMERGE_* overrides in job scripts keep working.
+QC_RMERGE_ABS=${QC_RMERGE_ABS:-1.5}       # flag a window if overall Rmeas > this ...
+QC_RMERGE_FACTOR=${QC_RMERGE_FACTOR:-3}   # ... or > FACTOR x median Rmeas(all windows)
 QC_TRIMS=${QC_TRIMS:-"60 120 180 240"}    # leading frames to try excluding
 QC_MIN_COMPL=${QC_MIN_COMPL:-80}          # keep a trim only if completeness >= this (%)
+QC_MIN_GAIN=${QC_MIN_GAIN:-0.20}          # a larger trim replaces a smaller accepted one
+                                          #   only if it improves Rmeas by this fraction
 
 if [ "$QC_ENABLE" -eq 1 ] && [ "${#CHUNK_JOBIDS[@]}" -gt 0 ]; then
     QC_SCRIPT="${PROCESS_DIR}/trfrx_qc_refix.sh"
@@ -431,6 +447,7 @@ QC_RMERGE_ABS="$QC_RMERGE_ABS"
 QC_RMERGE_FACTOR="$QC_RMERGE_FACTOR"
 QC_TRIMS="$QC_TRIMS"
 QC_MIN_COMPL="$QC_MIN_COMPL"
+QC_MIN_GAIN="$QC_MIN_GAIN"
 EOF
     # --- logic (quoted heredoc: nothing expands until the QC job runs) ---
     cat >> "$QC_SCRIPT" <<'QCEOF'
@@ -440,21 +457,26 @@ LOG="$PROCESS_DIR/reports_qc/qc_refix.log"
 FIXED_TSV="$PROCESS_DIR/reports_qc/qc_fixed.tsv"; : > "$FIXED_TSV"   # window<TAB>old_Rmerge<TAB>new_Rmerge<TAB>excluded<TAB>images_used
 say(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-# scrape overall Rmerge or Completeness from a chunk output dir
-scrape(){ # $1 dir, $2 rmerge|compl -> value or empty
-    local d="$1" what="$2" tmp tab val=""
+# scrape one overall statistic from a chunk output dir. The column widths in
+# table1 vary, so the label is matched with [[:space:]]+ rather than fixed gaps.
+scrape(){ # $1 dir, $2 rmerge|rmeas|rpim|compl -> value or empty
+    local d="$1" what="$2" tmp tab pat val=""
+    case "$what" in
+        rmerge) pat='Rmerge[[:space:]]+\(all I\+ & I-\)' ;;
+        rmeas)  pat='Rmeas[[:space:]]+\(all I\+ & I-\)'  ;;
+        rpim)   pat='Rpim[[:space:]]+\(all I\+ & I-\)'   ;;
+        *)      pat='Completeness \(spherical\)'          ;;
+    esac
     tmp=$(mktemp -d)
     [ -f "$d/summary.tar.gz" ] && tar -xzf "$d/summary.tar.gz" -C "$tmp" 2>/dev/null
     tab=$(find "$tmp" "$d" -name 'aimless_alldata-unique.table1' 2>/dev/null | head -1)
-    if [ -n "$tab" ]; then
-        if [ "$what" = rmerge ]; then
-            val=$(grep -m1 'Rmerge  (all I+ & I-)' "$tab" | grep -oE '[0-9]+\.[0-9]+' | head -1)
-        else
-            val=$(grep -m1 'Completeness (spherical)' "$tab" | grep -oE '[0-9]+\.[0-9]+' | head -1)
-        fi
-    fi
+    [ -n "$tab" ] && val=$(grep -m1 -E "$pat" "$tab" | grep -oE '[0-9]+\.[0-9]+' | head -1)
     rm -rf "$tmp"; echo "$val"
 }
+
+# median of a whitespace-separated list (empty when the list is empty)
+med_of(){ printf '%s\n' $1 | sort -n \
+          | awk '{a[NR]=$1} END{if(NR)print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }
 
 # Number of images actually used in the merge. Used to confirm that
 # EXCLUDE_DATA_RANGE really removed frames from the FINAL merge (and not just
@@ -470,6 +492,20 @@ scrape_images(){ # $1 dir -> integer or empty
         [ -n "$val" ] && break
     done < <(find "$tmp" "$d" -maxdepth 3 \
                   \( -name 'aimless*.log' -o -name '*.table1' \) 2>/dev/null | head -20)
+    # Builds that never spell the count out record the surviving image RANGE
+    # instead: XDS CORRECT.LP writes "DATA_RANGE=  1  146" once frames are
+    # dropped, and the count is last - first + 1. Without this the count comes
+    # back empty and the exclusion check below can never confirm anything.
+    if [ -z "$val" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            val=$(grep -hoiE 'DATA_RANGE=[[:space:]]*[0-9]+[[:space:]]+[0-9]+' "$f" \
+                       2>/dev/null | head -1 \
+                  | grep -oE '[0-9]+[[:space:]]+[0-9]+' | head -1 \
+                  | awk '{ if ($2 >= $1) print $2 - $1 + 1 }')
+            [ -n "$val" ] && break
+        done < <(find "$tmp" "$d" -maxdepth 3 -name 'CORRECT.LP' 2>/dev/null | head -5)
+    fi
     rm -rf "$tmp"; echo "$val"
 }
 
@@ -492,19 +528,32 @@ if [ "${#DIRS[@]}" -eq 0 ]; then
     exit 0
 fi
 
-declare -a RM; allr=""
-for d in "${DIRS[@]}"; do r=$(scrape "$d" rmerge); RM+=("$r"); [ -n "$r" ] && allr="$allr $r"; done
-med=$(printf '%s\n' $allr | sort -n | awk '{a[NR]=$1} END{if(NR)print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}')
+# Flag and select on Rmeas, not Rmerge. Rmerge falls as multiplicity falls, so
+# selecting on it rewards throwing data away: every extra trim "improves" it even
+# when the surviving data is no better. Rmeas is multiplicity-corrected and does
+# not have that bias. Rpim is scraped too, as a guard below.
+declare -a RMEAS RPIM; allm=""; allp=""
+for d in "${DIRS[@]}"; do
+    m=$(scrape "$d" rmeas); RMEAS+=("$m"); [ -n "$m" ] && allm="$allm $m"
+    q=$(scrape "$d" rpim);  RPIM+=("$q");  [ -n "$q" ] && allp="$allp $q"
+done
+med=$(med_of "$allm")
 thr=$(awk -v m="${med:-0}" -v f="$QC_RMERGE_FACTOR" -v a="$QC_RMERGE_ABS" 'BEGIN{t=m*f; print (t>a)?t:a}')
-say "median window Rmerge=${med:-NA}  flag-threshold=$thr (abs=$QC_RMERGE_ABS, factor=$QC_RMERGE_FACTOR)"
+med_pim=$(med_of "$allp")
+# Rpim measures the precision of the MERGED intensities -- the data that actually
+# feeds the difference maps -- and it gets WORSE as multiplicity drops. Capping it
+# against the series median is what stops an over-aggressive trim from buying a
+# tidy Rmeas at the cost of the merged data everything downstream depends on.
+say "median window Rmeas=${med:-NA}  flag-threshold=$thr (abs=$QC_RMERGE_ABS, factor=$QC_RMERGE_FACTOR)"
+say "median window Rpim=${med_pim:-NA}   (trims are selected on Rpim = merged precision)"
 
 for k in "${!DIRS[@]}"; do
-    d="${DIRS[$k]}"; r="${RM[$k]}"
+    d="${DIRS[$k]}"; r="${RMEAS[$k]}"
     base=$(basename "$d"); ij=${base#autoPROC_}; i=${ij%_*}; j=${ij#*_}
-    [ -z "$r" ] && { say "SKIP $base (Rmerge not parsed)"; continue; }
+    [ -z "$r" ] && { say "SKIP $base (Rmeas not parsed)"; continue; }
     [ "$(awk -v r="$r" -v t="$thr" 'BEGIN{print (r>t)?1:0}')" -eq 0 ] && continue
-    say "OUTLIER $base: Rmerge=$r > $thr -> retry excluding dead leading frames"
-    best_r="$r"; best_dir=""; best_ex=""; best_img=""
+    say "OUTLIER $base: Rmeas=$r > $thr -> retry excluding dead leading frames"
+    best_m=""; best_dir=""; best_ex=""; best_img=""; best_pim=""
     oi=$(scrape_images "$d")      # images used by the ORIGINAL (untrimmed) run
     [ -z "$oi" ] && say "  NOTE: images-used not parsed for $base;"\
                         " the EXCLUDE_DATA_RANGE effect cannot be confirmed"
@@ -517,13 +566,13 @@ for k in "${!DIRS[@]}"; do
                    -ref "$REF_MTZ" AutoProcScale_RunStaraniso=yes \
                    autoPROC_XdsKeyword_EXCLUDE_DATA_RANGE="$estart $eend" \
                    -d "$tmp" >>"$LOG" 2>&1; then
-            nr=$(scrape "$tmp" rmerge); nc=$(scrape "$tmp" compl)
-            ni=$(scrape_images "$tmp")
-            say "    -> Rmerge=${nr:-NA} completeness=${nc:-NA} images_used=${ni:-NA}"
+            nm=$(scrape "$tmp" rmeas); np=$(scrape "$tmp" rpim)
+            nc=$(scrape "$tmp" compl); ni=$(scrape_images "$tmp")
+            say "    -> Rmeas=${nm:-NA} Rpim=${np:-NA} completeness=${nc:-NA} images_used=${ni:-NA}"
             # Did EXCLUDE_DATA_RANGE actually reach the FINAL merge? If both
             # counts are known and the trimmed run used just as many images, the
             # keyword did nothing in this autoPROC build: reject the trim instead
-            # of crediting it with an Rmerge change it cannot explain.
+            # of crediting it with a change it cannot explain.
             excl_ok=1; excl_note="unverified"
             if [ -n "$ni" ] && [ -n "$oi" ]; then
                 if [ "$(awk -v n="$ni" -v o="$oi" 'BEGIN{print (n<o)?1:0}')" -eq 1 ]; then
@@ -537,12 +586,33 @@ for k in "${!DIRS[@]}"; do
                 fi
             else
                 say "       WARNING: images-used not parsed (orig=${oi:-NA} trim=${ni:-NA});"\
-                    " accepting on Rmerge/completeness alone - exclusion UNVERIFIED"
+                    " accepting on Rmeas/completeness alone - exclusion UNVERIFIED"
             fi
-            if [ -n "$nr" ] && [ "$excl_ok" -eq 1 ] \
+            # A trim qualifies only if it actually FIXES the window (Rmeas back
+            # under the flag threshold) at acceptable completeness; among those,
+            # the winner is the one with the lowest Rpim.
+            if [ -n "$nm" ] && [ -n "$np" ] && [ "$excl_ok" -eq 1 ] \
                && [ "$(awk -v c="${nc:-0}" -v mc="$QC_MIN_COMPL" 'BEGIN{print (c>=mc)?1:0}')" -eq 1 ] \
-               && [ "$(awk -v n="$nr" -v b="$best_r" 'BEGIN{print (n<b)?1:0}')" -eq 1 ]; then
-                best_r="$nr"; best_dir="$tmp"; best_ex="$estart-$eend"; best_img="$excl_note"
+               && [ "$(awk -v n="$nm" -v t="$thr" 'BEGIN{print (n<t)?1:0}')" -eq 1 ]; then
+                # Rpim is the precision of the MERGED mean, so it has a real
+                # optimum: trim too little and bad frames poison the mean, trim
+                # too much and the lost multiplicity makes it worse. Minimising it
+                # lands on the right trim with no extra cap needed. Trims are
+                # tried in increasing order, so a larger one displaces a smaller
+                # accepted one only for a gain of at least QC_MIN_GAIN -- a 1-5%
+                # drift never costs a third of the window's images.
+                if [ -z "$best_dir" ]; then
+                    best_m="$nm"; best_dir="$tmp"; best_ex="$estart-$eend"
+                    best_img="$excl_note"; best_pim="$np"
+                    say "       ACCEPTED (smallest trim that fixes the window; Rpim=$np)"
+                elif [ "$(awk -v n="$np" -v b="$best_pim" -v g="$QC_MIN_GAIN" \
+                          'BEGIN{print (n < b*(1-g))?1:0}')" -eq 1 ]; then
+                    best_m="$nm"; best_dir="$tmp"; best_ex="$estart-$eend"
+                    best_img="$excl_note"; best_pim="$np"
+                    say "       ACCEPTED (Rpim $np beats $best_pim by more than QC_MIN_GAIN)"
+                else
+                    say "       kept the smaller trim (Rpim $np vs $best_pim: not enough gain)"
+                fi
             fi
         else
             say "    process failed for trim=$T"
@@ -551,11 +621,11 @@ for k in "${!DIRS[@]}"; do
     if [ -n "$best_dir" ]; then
         mv "$d" "${d}.qc_orig_backup"
         mv "$best_dir" "$d"
-        printf '%s\t%s\t%s\t%s\t%s\n' "${i}_${j}" "$r" "$best_r" "$best_ex" \
-               "${best_img:-unverified}" >> "$FIXED_TSV"
-        say "FIXED $base: Rmerge $r -> $best_r (excluded $best_ex, images ${best_img:-unverified}); original -> ${base}.qc_orig_backup"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${i}_${j}" "$r" "$best_m" "$best_ex" \
+               "${best_img:-unverified}" "${best_pim:-NA}" >> "$FIXED_TSV"
+        say "FIXED $base: Rmeas $r -> $best_m, Rpim ${best_pim:-NA} (excluded $best_ex, images ${best_img:-unverified}); original -> ${base}.qc_orig_backup"
     else
-        say "NO IMPROVEMENT for $base (original kept) — inspect manually"
+        say "NO IMPROVEMENT for $base (original kept) - inspect manually"
     fi
     rm -rf "${PROCESS_DIR}"/qcfix_${i}_${j}_trim* 2>/dev/null
 done
@@ -692,6 +762,16 @@ IMAGES_USED_RES = [
     ("images-used",     re.compile(r"number\s+of\s+images\s+used\s*[:=]?\s*(\d+)", re.I)),
     ("images-accepted", re.compile(r"images\s+(?:used|accepted)\s*[:=]?\s*(\d+)", re.I)),
     ("xds-of-images",   re.compile(r"of\s+(\d+)\s+images", re.I)),
+]
+
+# Not every autoPROC build prints an images-used count in words. XDS records the
+# image RANGE that survived instead -- CORRECT.LP carries "DATA_RANGE= 1 146"
+# after it has dropped frames -- and the count is last - first + 1. Without this
+# the count is N/A on such builds, which empties the "images used" series and,
+# more importantly, leaves the QC frame-exclusion check unable to confirm that
+# EXCLUDE_DATA_RANGE did anything.
+IMAGES_RANGE_RES = [
+    ("xds-data-range", re.compile(r"DATA_RANGE\s*=\s*(\d+)\s+(\d+)", re.I)),
 ]
 
 # ISa — asymptotic I/sigma(I) = 1/sqrt(a*b) from the XDS CORRECT.LP error model
@@ -848,6 +928,12 @@ def scrape_images_used(text):
         m = rex.search(text)
         if m:
             return int(m.group(1)), tag
+    for tag, rex in IMAGES_RANGE_RES:
+        m = rex.search(text)
+        if m:
+            first, last = int(m.group(1)), int(m.group(2))
+            if last >= first:
+                return last - first + 1, tag
     return None, None
 
 
@@ -875,7 +961,7 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
     best = {"truncate": None, "staraniso": None}
     best_rank = {"truncate": (-1, -1), "staraniso": (-1, -1)}
     extra = {r: {"cell": None, "mtz": None, "wilson_b": None, "images_used": None,
-                 "wb_source": None, "isa": None,
+                 "wb_source": None, "isa": None, "merged_mtz": False,
                  "cell_rank": -1, "mtz_rank": -1, "wb_rank": -1, "img_rank": -1,
                  "isa_rank": -1}
              for r in ("truncate", "staraniso")}
@@ -924,6 +1010,10 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
         e = extra[route]
         if prio > e["mtz_rank"]:
             e["mtz"], e["mtz_rank"] = fpath, prio
+        # Separately, note whether the route's OWN canonical merged file is
+        # there. Any other .mtz is not a substitute for it.
+        if fname.lower() == _MERGED_MTZ[route]:
+            e["merged_mtz"] = True
 
     def handle_text(fname, rel, text, path_hint=""):
         """Scrape one text file (loose on disk or read from summary.tar.gz)."""
@@ -1022,7 +1112,8 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
         e = extra[route]
         data.update({"cell": e["cell"], "mtz": e["mtz"],
                      "wilson_b": e["wilson_b"], "wb_source": e["wb_source"],
-                     "images_used": e["images_used"], "isa": e["isa"]})
+                     "images_used": e["images_used"], "isa": e["isa"],
+                     "merged_mtz": e["merged_mtz"]})
         has_any = (best[route] or e["cell"] or e["mtz"]
                    or e["wilson_b"] is not None or e["images_used"] is not None
                    or e["isa"] is not None)
@@ -1084,6 +1175,9 @@ def build_row(chunk_name, first, last, block, wilson_b, images_used,
         ("image_last", last),
         ("n_images", last - first + 1),
         ("images_used", images_used if images_used is not None else "N/A"),
+        # "no" means this route's merged reflection file is absent -> the chunk
+        # failed, however much else survived in its folder.
+        ("merged_mtz", "yes" if (block and block.get("merged_mtz")) else "no"),
         ("QC_fixed", QC_FIXED.get("%d_%d" % (first, last), "")),
         ("t_start_s", _ts(t_start)),
         ("t_end_s", _ts(t_end)),
@@ -1332,41 +1426,6 @@ def _read_mtz_intensities(mtz_path):
     return data, inv_d2[good], ivals[good]
 
 
-def wilson_b_from_arrays(inv_d2, ivals, d_cut=4.0, nbins=20):
-    """Relative Wilson B from a straight-line fit of ln<I> vs (sin th/lambda)^2.
-
-    Uses reflections with d < d_cut (the ~linear high-resolution part of the
-    Wilson plot). The atomic-scattering term is omitted, so the absolute value
-    carries an offset that is identical across chunks (same composition and
-    binning) and therefore cancels in dB. Returns B (A^2) or None."""
-    try:
-        import numpy as np
-    except ImportError:
-        return None
-    if inv_d2 is None or len(inv_d2) < 200:
-        return None
-    sel = inv_d2 >= (1.0 / (d_cut * d_cut))
-    if sel.sum() < 200:
-        sel = np.ones(len(inv_d2), dtype=bool)
-    x = inv_d2[sel] / 4.0                    # (sin theta / lambda)^2
-    y = ivals[sel]
-    edges = np.linspace(x.min(), x.max(), nbins + 1)
-    idx = np.clip(np.digitize(x, edges) - 1, 0, nbins - 1)
-    xs, ys = [], []
-    for b in range(nbins):
-        m = idx == b
-        if m.sum() < 5:
-            continue
-        mi = y[m].mean()
-        if mi <= 0:
-            continue
-        xs.append(0.5 * (edges[b] + edges[b + 1]))
-        ys.append(math.log(mi))
-    if len(xs) < 5:
-        return None
-    slope, _ = np.polyfit(np.array(xs), np.array(ys), 1)
-    b = -slope / 2.0
-    return b if math.isfinite(b) else None
 
 
 def gemmi_available():
@@ -1378,31 +1437,6 @@ def gemmi_available():
         return False
 
 
-def wilson_b_by_chunk(rows_meta, diagnostics, route):
-    """Estimate Wilson B from each chunk's merged MTZ (only where not scraped).
-
-    rows_meta: list of dicts with keys chunk, mtz, wilson_scraped.
-    Returns {chunk: B}."""
-    result = {}
-    if not gemmi_available():
-        diagnostics.append("    [%s] gemmi unavailable in this Python — Wilson B "
-                           "(MTZ fallback) skipped; run with the trfrx venv to "
-                           "enable it" % route)
-        return result
-    for meta in rows_meta:
-        mtz = meta["mtz"]
-        if not mtz or meta["wilson_scraped"] is not None:
-            continue
-        _data, inv_d2, ivals = _read_mtz_intensities(mtz)
-        if inv_d2 is None:
-            diagnostics.append("    [%s] could not read MTZ %s" % (route, mtz))
-            continue
-        b = wilson_b_from_arrays(inv_d2, ivals)
-        if b is not None:
-            result[meta["chunk"]] = b
-            diagnostics.append("    [%s] Wilson B = %.2f <- %s (from merged I)"
-                               % (route, b, os.path.basename(mtz)))
-    return result
 
 
 # --------------------------------------------------------------------------
@@ -1415,6 +1449,194 @@ _PALETTE = ["#4477AA", "#EE6677", "#44AA99"]
 _SOLID   = "-"
 _DASH    = (0, (4, 2.2))
 _INK, _MUT, _GRID, _SPINE = "#1a2530", "#5c6b76", "#eceff2", "#c4ced4"
+_OUTLIER = "#C0392B"
+
+# --- Implausible values ------------------------------------------------------
+# A chunk that failed indexing or integration still reports numbers, and they can
+# be absurd: Rmerge in the thousands, a unit-cell edge of 300 A. Matplotlib then
+# autoscales to that one value and every real variation collapses into a flat
+# line. Such a value is not an unusual measurement, it is not a measurement at
+# all, so it is dropped from the plotted line and its window is marked with a
+# cross at the axis edge. The axis is then scaled to the real data alone.
+#
+# The test is PHYSICAL, not statistical: each metric has a range outside which a
+# value cannot be a real measurement. Nothing is judged "unusual" and no real
+# datum is ever hidden, however extreme -- a genuinely bad but possible window
+# (Rmerge 1.8, completeness 31 %, CC1/2 of -0.3) is plotted normally.
+# Only the plots are affected; the statistics CSVs always keep every value.
+CLIP_OUTLIERS = True    # --no-clip-outliers plots every value, however absurd
+
+_R_MAX = 5.0            # Rmerge/Rmeas/Rpim are ratios; >5 means the merge failed
+_VALID_RANGE = {
+    "resolution_high":          (0.3, 30.0),    # A; outside this is not a lattice
+    "Rmerge":                   (0.0, _R_MAX),
+    "Rmeas":                    (0.0, _R_MAX),
+    "Rpim":                     (0.0, _R_MAX),
+    "Mean_I_over_sigma":        (0.0, 1e4),
+    "Mean_I_over_sigma_outer":  (0.0, 1e4),
+    "Isa":                      (0.0, 1e4),
+    "CC_half":                  (-1.0, 1.0),    # a correlation coefficient
+    "CC_half_outer":            (-1.0, 1.0),
+    "CC_ano":                   (-1.0, 1.0),
+    "CC_ano_outer":             (-1.0, 1.0),
+    "Completeness":             (0.0, 100.0),   # a percentage
+    "Completeness_ellipsoidal": (0.0, 100.0),
+    "Multiplicity":             (0.0, 1e4),
+    "Multiplicity_outer":       (0.0, 1e4),
+    "Wilson_B":                 (0.0, 1e3),     # A^2
+    "n_images":                 (0.0, 1e7),
+    "images_used":              (0.0, 1e7),
+}
+
+# Unit-cell edges have no fixed bounds, so isomorphism supplies one: it is the
+# same crystal throughout, and radiation damage moves an edge by a few percent at
+# most. An edge a quarter away from the series median is a wrong indexing
+# solution, not an expanded cell.
+# The merged reflection file each route is supposed to produce. Its absence is
+# the most direct evidence a chunk failed: whatever else survived in the folder,
+# the merge produced nothing to hand downstream.
+_MERGED_MTZ = {"staraniso": "staraniso_alldata-unique.mtz",
+               "truncate":  "truncate-unique.mtz"}
+
+# A merged dataset whose mean intensity is below its own uncertainty carries no
+# signal at all: I/sigma < 1 says the average reflection is weaker than its error
+# bar, so there is nothing in it to measure, subtract or scale.
+#
+# This is a SEPARATE judgement from _VALID_RANGE. That one asks only whether a
+# number could be a measurement; here the number is perfectly real and simply
+# reports that the measurement is empty. Kept apart so the distinction stays
+# visible rather than being smuggled into a validity bound.
+#
+# The OVERALL value only -- the outer shell sits near 1 in perfectly good data
+# (about 1.4 in this series), so applying it there would condemn good windows.
+_MIN_I_OVER_SIGMA = 1.0
+
+# The same judgement from the other side: an R-factor above 1 means the spread
+# among observations of a reflection exceeds the reflection itself. Rmeas is used
+# rather than Rmerge because it is multiplicity-corrected, so a window is not
+# condemned merely for having been measured many times.
+#
+# NB on the margin: in the series this was tuned against, the worst usable window
+# sat at Rmeas 0.69 and the worst unusable one at 1.007 -- so 1.0 sits at the very
+# top of that gap and catches the latter by less than a percent. The value is kept
+# because it means something physical rather than because it is comfortable; a
+# window at 0.98 would slip through. Lower it if that matters for a given series.
+_MAX_RMEAS = 1.0
+
+_CELL_COLS = ("cell_a", "cell_b", "cell_c")
+_CELL_MAX_DEV = 0.25
+
+# Statistics that exist ONLY if the merge succeeded. Deliberately excluded:
+#   n_images  - read from the chunk's directory name
+#   Isa       - from XDS CORRECT.LP, written even when nothing merges
+#   Wilson_B  - fitted from the MTZ, and it has its own fallback path
+#   cell_*    - from the MTZ header / CORRECT.LP
+# Those four survive a failed merge, so counting them as data would let a chunk
+# that produced no statistics at all look populated.
+_MEASURED_COLS = ("resolution_high", "Rmerge", "Rmeas", "Rpim",
+                  "Mean_I_over_sigma", "CC_half", "CC_ano",
+                  "Completeness", "Multiplicity")
+
+# An impossible value in one of these means the MERGE failed, so the whole chunk
+# is untrustworthy and is dropped from every panel. Everything else in
+# _VALID_RANGE (Wilson_B, Isa) is a derived quantity with its own failure mode --
+# a Wilson fit can diverge on an otherwise usable chunk, and condemning the whole
+# window for it would throw away good merging statistics. Those are masked value
+# by value instead.
+_FATAL_COLS = ("resolution_high", "Rmerge", "Rmeas", "Rpim",
+               "Mean_I_over_sigma", "Mean_I_over_sigma_outer",
+               "CC_half", "CC_half_outer", "CC_ano", "CC_ano_outer",
+               "Completeness", "Completeness_ellipsoidal",
+               "Multiplicity", "Multiplicity_outer")
+
+
+def _failed_windows(rows):
+    """{(image_first, image_last), ...} for chunks that demonstrably failed.
+
+    A chunk is failed when ANY of its metrics is physically impossible. That is a
+    property of the chunk, not of the one metric: if the merge produced
+    Rmerge = 22800 then that chunk's resolution, B-factor and completeness are
+    products of the same failure and are excluded from every panel too. A chunk
+    whose numbers are merely poor is never in this set."""
+    failed = {}
+    refs = {c: _median([to_float(dict(r).get(c)) for r in rows
+                        if to_float(dict(r).get(c)) is not None])
+            for c in _CELL_COLS}
+    for r in rows:
+        d = dict(r)
+        a, b = to_float(d.get("image_first")), to_float(d.get("image_last"))
+        if a is None or b is None:
+            continue
+        # No merged reflection file for this route: autoPROC produced nothing to
+        # hand downstream, so the chunk failed whatever else survived in its
+        # folder. Checked first because it is the most direct evidence there is.
+        # (Guarded on the column being present, so a CSV written by an older
+        # version of this script does not read as all-failed.)
+        if str(d.get("merged_mtz", "")).lower() == "no":
+            failed[(a, b)] = "no merged reflection file"
+            continue
+        # Or: images, but not one usable merging statistic. Same conclusion.
+        if not any(to_float(d.get(c)) is not None for c in _MEASURED_COLS):
+            failed[(a, b)] = "no merging statistics"
+            continue
+        # Or: statistics exist but describe noise, from either side --
+        # signal below its own error bar, or scatter larger than the signal.
+        isig = to_float(d.get("Mean_I_over_sigma"))
+        if isig is not None and isig < _MIN_I_OVER_SIGMA:
+            failed[(a, b)] = "no signal (I/sigma %.1f < %.1f)" % (isig, _MIN_I_OVER_SIGMA)
+            continue
+        rmeas = to_float(d.get("Rmeas"))
+        if rmeas is not None and rmeas > _MAX_RMEAS:
+            failed[(a, b)] = "no signal (Rmeas %.3f > %.1f)" % (rmeas, _MAX_RMEAS)
+            continue
+        for col in _FATAL_COLS:
+            y = to_float(d.get(col))
+            if y is not None and _implausible(col, y):
+                failed[(a, b)] = "impossible %s = %g" % (col, y)
+                break
+        else:
+            for col in _CELL_COLS:
+                y = to_float(d.get(col))
+                if y is not None and _implausible(col, y, refs.get(col)):
+                    failed[(a, b)] = ("non-isomorphous %s = %g (median %g)"
+                                      % (col, y, refs.get(col) or 0))
+                    break
+    return failed
+
+
+def annotate_fail_reason(rows):
+    """Return *rows* with a fail_reason column appended (empty when usable).
+
+    Written into the statistics CSV so the verdict travels with the numbers:
+    a crossed window in the plots says only that it was rejected, never why,
+    and 'produced no merged file' and 'merged fine but is noise' are opposite
+    conclusions about the experiment."""
+    failed = _failed_windows(rows)
+    out = []
+    for r in rows:
+        d = dict(r)
+        a, b = to_float(d.get("image_first")), to_float(d.get("image_last"))
+        out.append(list(r) + [("fail_reason", failed.get((a, b), ""))])
+    return out
+
+
+def _median(vals):
+    v = sorted(vals)
+    n = len(v)
+    if not n:
+        return None
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _implausible(col, y, cell_ref=None):
+    """True if *y* cannot be a real measurement of *col* (see _VALID_RANGE)."""
+    rng = _VALID_RANGE.get(col)
+    if rng and not (rng[0] <= y <= rng[1]):
+        return True
+    if col in _CELL_COLS and cell_ref:
+        return abs(y - cell_ref) > _CELL_MAX_DEV * cell_ref
+    return False
+
 
 # Linear image->seconds transform for the secondary (top) x-axis. Set once in
 # main() to (dt_s, t0_image, t0_s) when a frame period is known; left None (no
@@ -1431,21 +1653,29 @@ def _step_xy(rows, col, pct=False):
     vals = []
     for r in rows:
         d = dict(r)
-        y = to_float(d.get(col))
         a = to_float(d.get("image_first"))
         b = to_float(d.get("image_last"))
-        if y is None or a is None or b is None:
+        if a is None or b is None:
             continue
-        vals.append((a, b, y))
+        # A window with no value is KEPT, carrying None. Dropping it instead
+        # would leave its neighbours adjacent in the array, and matplotlib would
+        # join them with a straight line -- drawing continuity across a window
+        # nothing is known about. It becomes NaN below, which breaks the line.
+        vals.append((a, b, to_float(d.get(col))))
+    if not any(v[2] is not None for v in vals):
+        return [], []                  # nothing measured for this series at all
     if pct:
-        if not vals or vals[0][2] == 0:
+        base = next((v[2] for v in vals if v[2] is not None), None)
+        if not base:
             return [], []
-        base = vals[0][2]
-        vals = [(a, b, 100.0 * (y - base) / base) for a, b, y in vals]
+        vals = [(a, b, None if y is None else 100.0 * (y - base) / base)
+                for a, b, y in vals]
+    nan = float("nan")
     xs, ys = [], []
     for a, b, y in vals:
+        v = nan if y is None else y
         xs += [a, b]
-        ys += [y, y]
+        ys += [v, v]
     return xs, ys
 
 
@@ -1524,11 +1754,35 @@ def _draw_panel(ax, panel, rows, xr, show_repro_bands=True):
     x0, x1, xpad = xr
     C = _PALETTE
     drew = False
+    good_y = []                # values actually plotted, for the y limits
+    bad_x = set()              # x-midpoints of values dropped in THIS panel only
+    # Chunks that failed: an impossible value, or images but no statistics.
+    # Excluded from every panel and marked with a cross below.
+    failed = _failed_windows(rows) if CLIP_OUTLIERS else set()
     for lab, col, pct, ci, dash in specs:
         xs, ys = _step_xy(rows, col, pct)
         if not xs:
             continue
-        ax.plot(xs, ys, color=C[ci % len(C)], lw=1.8, ls=dash,
+        # Blank out failed chunks so they neither draw a spike nor set the
+        # scale. NaN breaks the line, leaving a visible gap at that window.
+        ref = (_median([v for v in ys if v == v])
+               if (CLIP_OUTLIERS and col in _CELL_COLS) else None)
+        plot_ys = []
+        for i, y in enumerate(ys):
+            # A failed chunk is dropped from every panel. A value that is
+            # impossible on its own -- a diverged Wilson-B fit on an otherwise
+            # usable chunk -- is dropped only where it appears, so its good
+            # merging statistics still show in the other panels.
+            if (xs[i - i % 2], xs[i - i % 2 + 1]) in failed or (
+                    CLIP_OUTLIERS and not pct and _implausible(col, y, ref)):
+                plot_ys.append(float("nan"))    # break the line here
+                if i % 2 == 0:
+                    bad_x.add(0.5 * (xs[i] + xs[i + 1]))
+            else:
+                plot_ys.append(y)
+                if y == y:             # skip NaN: a window with no value
+                    good_y.append(y)
+        ax.plot(xs, plot_ys, color=C[ci % len(C)], lw=1.8, ls=dash,
                 label=(lab or None), solid_capstyle="round")
         drew = True
     if show_repro_bands:
@@ -1572,6 +1826,29 @@ def _draw_panel(ax, panel, rows, xr, show_repro_bands=True):
         secax.tick_params(length=0, labelsize=7.5, colors=_MUT)
         for sp in secax.spines.values():
             sp.set_visible(False)
+    # Scale to the real data alone, then mark each dropped window with a cross at
+    # the edge it went past. Must run before invert_yaxis(), which flips whatever
+    # limits are current.
+    if CLIP_OUTLIERS and drew:
+        if good_y:
+            lo, hi = min(good_y), max(good_y)
+            if hi > lo:
+                pad = 0.08 * (hi - lo)
+                ax.set_ylim(lo - pad, hi + pad)
+        # One cross per failed window, sitting just above the x axis. Taken from
+        # the failed set rather than from the plotted points, so a window that
+        # produced NO statistics is marked as well -- otherwise a failed chunk is
+        # indistinguishable from one that was never collected. The blended
+        # transform takes x in data units and y as a fraction of the axes height,
+        # so the cross stays at the visual bottom even on the inverted
+        # (resolution) panel, and never moves when the y limits change.
+        # Failed chunks (marked in every panel) plus anything dropped in this
+        # panel alone; a set, so one window never gets two crosses.
+        marks = set(0.5 * (_a + _b) for _a, _b in failed) | bad_x
+        for xm in sorted(marks):
+            ax.plot([xm], [0.035], marker="x", ms=6.5, mew=1.7,
+                    color=_OUTLIER, clip_on=False, zorder=6,
+                    transform=ax.get_xaxis_transform())
     if invert and drew:
         ax.invert_yaxis()
     if not drew:
@@ -1758,6 +2035,14 @@ def write_pdf(path, dataset, title, rows, image_summary, wilson_method="",
         ]
         if limit_note:
             lines += ["", limit_note]
+        _failed = _failed_windows(rows)
+        if _failed:
+            lines += ["", "Excluded chunks (crossed in the plots):"]
+            for (_fa, _fb), _why in sorted(_failed.items()):
+                lines.append("    %-20s %s"
+                             % ("%d-%d" % (int(_fa), int(_fb)), _why))
+            lines.append("    %-20s %d of %d chunks"
+                         % ("total excluded:", len(_failed), len(image_summary)))
         lines += ["", "Image ranges:"]
         for name, rng, n in image_summary:
             lines.append("    %-24s images %-14s (%d)" % (name, rng, n))
@@ -1780,15 +2065,32 @@ def write_pdf(path, dataset, title, rows, image_summary, wilson_method="",
     return True
 
 
+# Folder names that describe the processing, not the sample. The chunks can sit
+# under any of them (autoproc_chunks from this script, autoproc_copy from
+# trfrx_full_pipeline), and naming a report after one tells the reader nothing.
+_GENERIC_DIRS = ("autoproc_chunks", "autoproc_copy", "autoproc", "chunks",
+                 "reports", "output", "out", "proc", "processing", "data")
+
+
 def detect_dataset(process_dir, override):
+    """Name for the top of the reports: the first enclosing folder that actually
+    identifies the sample. Walks up past generic container folders, so chunks in
+    <sample>/autoproc_copy/ are reported under <sample> rather than
+    "autoproc_copy". Use --dataset to set it explicitly."""
     if override:
         return override
-    p = process_dir.rstrip(os.sep)
-    base = os.path.basename(p)
-    if base == "autoproc_chunks":
-        parent = os.path.basename(os.path.dirname(p))
-        return parent or base
-    return base
+    p = os.path.abspath(process_dir.rstrip(os.sep))
+    for _ in range(4):                      # bounded: never walk to the root
+        base = os.path.basename(p)
+        if not base:
+            break
+        if base.lower() not in _GENERIC_DIRS and not base.lower().startswith("autoproc"):
+            return base
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return os.path.basename(os.path.abspath(process_dir.rstrip(os.sep))) or "dataset"
 
 
 def main():
@@ -1808,6 +2110,15 @@ def main():
                              "keeps ...1801-2000 and drops 2001-2200. Output "
                              "files get an _upto<N> suffix so the full report "
                              "is never overwritten.")
+    parser.add_argument("--no-clip-outliers", action="store_true",
+                        help="Plot every value, however absurd. By default a "
+                             "value that cannot be a real measurement (a failed "
+                             "chunk reporting Rmerge in the thousands, or a cell "
+                             "edge a quarter away from the series median) is left "
+                             "out of the line and its window marked with a cross, "
+                             "so one failed chunk cannot flatten the whole "
+                             "series. Statistics CSVs keep every value either "
+                             "way.")
     # --- Real-time (acquisition time) options -----------------------------
     parser.add_argument("--image-template", default=None,
                         help="CBF template with #### OR an Eiger master .h5, used "
@@ -1844,7 +2155,8 @@ def main():
     # The time origin (t0_image) is resolved later, once the chunks are known.
     # Failures degrade to a warning; the CSV is still written with blank times
     # (source=UNRESOLVED).
-    global _XTIME
+    global _XTIME, CLIP_OUTLIERS
+    CLIP_OUTLIERS = not args.no_clip_outliers
     dt_s, osc_deg, tmeta = frame_period_from_header(
         args.images_dir, args.image_template, args.frame_time_ms, args.osc_per_image)
     t0_s = args.t0_seconds
@@ -1953,19 +2265,21 @@ def main():
                                 "mtz": b.get("mtz"),
                                 "wilson_scraped": b.get("wilson_b")})
 
-    diagnostics.append("MTZ-derived Wilson B (fallback when not scraped):")
-    wilson_mtz = {}
-    for route in ("truncate", "staraniso"):
-        wilson_mtz[route] = wilson_b_by_chunk(meta[route], diagnostics, route)
-
     def route_wilson(route, name):
+        """Wilson B for this route, or None. Only the value the route's own
+        program reported is used: CTRUNCATE for truncate, STARANISO's
+        Popov-Bourenkov value for staraniso.
+
+        There is deliberately no MTZ-fit fallback. Re-fitting a Wilson plot from
+        the merged MTZ is a different method with a different normalisation, so
+        its numbers are not comparable with the scraped values in the rest of the
+        series -- and on a poor chunk it can diverge outright (it produced
+        B = -1093 on a window whose merging statistics were otherwise usable).
+        A blank is honest; a number from a different method is not."""
         b = best_by_chunk[name][2][route]
         scraped = b.get("wilson_b") if b else None
         if scraped is not None:
             return scraped, (b.get("wb_source") or ("%s log" % route))
-        mtzb = wilson_mtz[route].get(name)
-        if mtzb is not None:
-            return mtzb, "MTZ fit (FALLBACK - different method!)"
         return None, "N/A"
 
     def rows_for(route):
@@ -1975,7 +2289,7 @@ def main():
             # Each route uses ONLY its own Wilson B (truncate -> CTRUNCATE,
             # staraniso -> STARANISO Popov-Bourenkov). No cross-route borrowing:
             # the two are computed with different normalisations, so mixing them
-            # would be meaningless. MTZ fit is a clearly-flagged last resort only.
+            # would be meaningless. There is no MTZ-fit fallback: see route_wilson.
             wilson, wsource = route_wilson(route, name)
             images = b.get("images_used") if b else None
             ts, te, tm, _dur = time_window(first, last, dt_s, t0_image, t0_s)
@@ -1989,7 +2303,7 @@ def main():
     }
     for route, pretty in [("truncate", "Classical autoPROC (TRUNCATE)"),
                           ("staraniso", "STARANISO")]:
-        rows = rows_for(route)
+        rows = annotate_fail_reason(rows_for(route))
         write_csv(os.path.join(out_dir, "%s_statistics%s.csv" % (route, suffix)),
                   rows)
         write_pdf(os.path.join(out_dir, "%s_report%s.pdf" % (route, suffix)),
