@@ -485,6 +485,18 @@ scrape_images(){ # $1 dir -> integer or empty
     local d="$1" tmp f val=""
     tmp=$(mktemp -d)
     [ -f "$d/summary.tar.gz" ] && tar -xzf "$d/summary.tar.gz" -C "$tmp" 2>/dev/null
+    # First choice: the header of the file that actually feeds the merge. Its
+    # !DATA_RANGE= is the frame count; an AIMLESS batch count is not, and can
+    # differ from it by a frame in either direction.
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        val=$(head -200 "$f" 2>/dev/null \
+              | grep -hoiE 'DATA_RANGE=[[:space:]]*[0-9]+[[:space:]]+[0-9]+' | head -1 \
+              | grep -oE '[0-9]+[[:space:]]+[0-9]+' | head -1 \
+              | awk '{ if ($2 >= $1) print $2 - $1 + 1 }')
+        [ -n "$val" ] && break
+    done < <(find "$tmp" "$d" -maxdepth 3 -name 'XDS_ASCII.HKL' 2>/dev/null | head -5)
+    [ -n "$val" ] && { rm -rf "$tmp"; echo "$val"; return; }
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         val=$(grep -hoiE 'number of (images used|batches)[[:space:]]*[:=]?[[:space:]]*[0-9]+' \
@@ -708,6 +720,7 @@ the parser can be tightened for non-standard filenames.
 import argparse
 import csv
 import datetime
+import itertools
 import math
 import os
 import re
@@ -998,8 +1011,17 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
         if images is not None:
             n, tag = images
             # Prefer AIMLESS batch count; keep the first plausible hit.
-            weight = {"aimless-batches": 3, "images-used": 2,
-                      "images-accepted": 2, "xds-of-images": 1}.get(tag, 0)
+            # XDS_ASCII.HKL is the file that actually feeds the merge, so its
+            # own !DATA_RANGE= header is the authoritative frame count and
+            # outranks everything else. AIMLESS's batch count is NOT a frame
+            # count: reflections spanning a frame boundary are assigned to
+            # batches during the XDS->MTZ conversion, so it can come out one
+            # high or one low (both seen in real data). A DATA_RANGE found in
+            # some other log ranks lowest -- pointless.log, for one, echoes the
+            # REQUESTED range, not the range that survived.
+            weight = {"xds-ascii-range": 5, "aimless-batches": 3,
+                      "images-used": 2, "images-accepted": 2,
+                      "xds-of-images": 1}.get(tag, 0)
             if weight > e["img_rank"]:
                 e["images_used"], e["img_rank"] = n, weight
                 diagnostics.append("    [%s] images used = %d <- %s (%s)"
@@ -1048,6 +1070,21 @@ def collect_chunk_blocks(chunk_dir, diagnostics):
             if low.endswith(".mtz"):
                 route = "staraniso" if "staraniso" in low else "truncate"
                 consider_mtz(route, fname, fpath)
+                continue
+            if low == "xds_ascii.hkl":
+                # Header only -- the reflection list below it can be hundreds of MB.
+                try:
+                    with open(fpath, "r", errors="replace") as fh:
+                        head = "".join(itertools.islice(fh, 200))
+                except (IOError, OSError):
+                    continue
+                m_rng = IMAGES_RANGE_RES[0][1].search(head)
+                if m_rng:
+                    first_i, last_i = int(m_rng.group(1)), int(m_rng.group(2))
+                    if last_i >= first_i:
+                        for _r in ("truncate", "staraniso"):
+                            consider_extra(_r, fname, rel, None, None,
+                                           (last_i - first_i + 1, "xds-ascii-range"))
                 continue
             if low.endswith(".tar.gz") or low.endswith(".tgz"):
                 tarballs.append(fpath)

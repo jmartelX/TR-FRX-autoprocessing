@@ -2013,6 +2013,12 @@ def build_series_recap(dfo_results: list[dict], sv_values, recap_path: Path,
     from matplotlib.backends.backend_pdf import PdfPages
     import pandas as pd
 
+    # The recap lives in the SVD folder, but that folder is only created once the
+    # SVD actually runs. When every map is excluded (e.g. a forced cutoff none of
+    # the datasets reach) the SVD returns early, and the recap -- which does not
+    # need the SVD -- would otherwise fail on a missing directory and be lost.
+    recap_path.parent.mkdir(parents=True, exist_ok=True)
+
     def _r(x, n):
         """Round for display; None/NaN -> None (blank in CSV)."""
         try:
